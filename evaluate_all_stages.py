@@ -176,14 +176,23 @@ def main():
     print("\nLoading iSarcasm test dataset...")
     df = pd.read_csv('data/isarcasm2022.csv', index_col=0)
     
-    # Create STRATIFIED test split to ensure balanced classes
-    from sklearn.model_selection import train_test_split
-    _, df_test = train_test_split(
-        df, 
-        test_size=0.2, 
-        random_state=42,
-        stratify=df['sarcastic']  # Ensures both classes are represented
-    )
+    # Load test indices from DPO training (to avoid data leakage)
+    if os.path.exists('isarcasm_test_indices.json'):
+        print("Loading test indices from DPO training split...")
+        with open('isarcasm_test_indices.json', 'r') as f:
+            test_indices = json.load(f)
+        df_test = df.loc[test_indices]
+        print("✓ Using held-out test set (not used in DPO training)")
+    else:
+        # Fallback: Create STRATIFIED test split to ensure balanced classes
+        print("⚠️  Test indices not found. Creating new split (may overlap with DPO training).")
+        from sklearn.model_selection import train_test_split
+        _, df_test = train_test_split(
+            df, 
+            test_size=0.2, 
+            random_state=42,
+            stratify=df['sarcastic']  # Ensures both classes are represented
+        )
     
     print(f"Test set: {len(df_test)} samples (stratified split)")
     print(f"  Sarcastic: {df_test['sarcastic'].sum()} ({df_test['sarcastic'].mean():.1%})")

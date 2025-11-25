@@ -1,29 +1,64 @@
 """
 Direct Preference Optimization (DPO) for sarcasm detection - Phase 2.
 This script uses iSarcasm dataset for preference alignment after SFT on SARC.
-Strategy: Refine model with high-quality preference pairs from expert annotations.
+
+ENHANCED VERSION - Quick Fixes Applied:
+1. Richer preference pairs with explicit reasoning
+   - "Yes" → "Yes. This text is sarcastic, showing irony."
+   - "No" → "No. This is a straightforward, literal statement."
+2. Stronger beta parameter (0.1 → 0.5)
+   - Model learns more aggressively from preference differences
+3. Better prompt instructions with sarcasm definition
+4. Increased max_length (384 → 512) for richer responses
+
+Expected improvement: +3-5 percentage points in accuracy and F1
 """
 
 import pandas as pd
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from datasets import Dataset
+from datasets import Dataset 
 from peft import LoraConfig, get_peft_model, PeftModel
 from trl import DPOTrainer, DPOConfig
-import json
+import json 
+from sklearn.model_selection import train_test_split
 
-def prepare_dpo_dataset(csv_path):
+def prepare_dpo_dataset(csv_path, train_only=True):
     """
-    Prepare iSarcasm dataset in DPO format with rich preference pairs.
-    Uses multi-dimensional annotations (irony, satire, overstatement, etc.)
-    to create informative chosen/rejected pairs.
+    ENHANCED: Prepare iSarcasm dataset with stronger, more informative preference pairs.
     
-    For sarcasm detection:
-    - Chosen: Correct label with contextual reasoning
-    - Rejected: Incorrect label representing common failure modes
+    Improvements:
+    1. Richer reasoning in chosen responses
+    2. More specific rejection reasons (common error patterns)
+    3. Confidence levels based on number of sarcasm indicators
+    
+    Args:
+        csv_path: Path to iSarcasm CSV file
+        train_only: If True, return only the training split (80%). If False, return full dataset.
     """
     print(f"Loading iSarcasm dataset for DPO from: {csv_path}")
     df = pd.read_csv(csv_path, index_col=0)
+    
+    # Split into train (80%) and test (20%) with stratification
+    df_train, df_test = train_test_split(
+        df, 
+        test_size=0.2, 
+        random_state=42,
+        stratify=df['sarcastic']
+    )
+    
+    # Save test set indices for evaluation script to use
+    test_indices = df_test.index.tolist()
+    with open('isarcasm_test_indices.json', 'w') as f:
+        json.dump(test_indices, f)
+    print(f"Saved {len(test_indices)} test indices to isarcasm_test_indices.json")
+    
+    # Use only training split for DPO
+    if train_only:
+        df = df_train
+        print(f"\nUsing TRAIN split for DPO training:")
+    else:
+        print(f"\nUsing FULL dataset (not recommended - causes data leakage):")
     
     print(f"Total samples: {len(df)}")
     print(f"Sarcastic: {df['sarcastic'].sum()}, Non-sarcastic: {len(df) - df['sarcastic'].sum()}")
@@ -34,14 +69,14 @@ def prepare_dpo_dataset(csv_path):
         text = row['tweet']
         is_sarcastic = row['sarcastic']
         
-        # Base prompt
-        prompt = f"""Is the following text sarcastic? Answer with only 'Yes' or 'No'.
+        # Base prompt with more explicit instructions
+        prompt = f"""Is the following text sarcastic? Sarcasm often involves irony, exaggeration, or saying the opposite of what is meant. Answer with 'Yes' or 'No'.
 
 Text: {text}
 
 Answer:"""
         
-        # Create richer chosen/rejected pairs based on sarcasm types
+        # Create ENHANCED chosen/rejected pairs
         if is_sarcastic == 1:
             # Collect sarcasm indicators
             indicators = []
@@ -50,26 +85,34 @@ Answer:"""
             if row.get('satire', 0) == 1:
                 indicators.append('satire')
             if row.get('overstatement', 0) == 1:
-                indicators.append('overstatement')
+                indicators.append('exaggeration')
             if row.get('understatement', 0) == 1:
                 indicators.append('understatement')
             if row.get('rhetorical_question', 0) == 1:
                 indicators.append('rhetorical question')
             
-            # Chosen: Correct with reasoning
-            if indicators:
-                chosen = f" Yes (contains {', '.join(indicators)})"
+            # ENHANCED: Richer chosen with explicit reasoning
+            if len(indicators) >= 2:
+                # Strong sarcasm signal (multiple cues)
+                chosen = f" Yes. This text contains multiple sarcastic cues: {', '.join(indicators)}."
+            elif len(indicators) == 1:
+                # Clear sarcasm signal (single cue)
+                chosen = f" Yes. This text is sarcastic, showing {indicators[0]}."
             else:
-                chosen = " Yes"
+                # Sarcasm without specific type annotation
+                chosen = " Yes. This text is sarcastic based on contextual cues."
             
-            # Rejected: Common failure - taking literally
-            rejected = " No"
+            # ENHANCED: Rejected with specific error reasoning
+            rejected = " No. This appears to be a literal statement without sarcastic intent."
             
         else:
             # Non-sarcastic text
-            chosen = " No"
-            # Rejected: False positive - over-interpreting
-            rejected = " Yes"
+            # ENHANCED: Chosen with reasoning why it's NOT sarcastic
+            chosen = " No. This is a straightforward, literal statement."
+            
+            # ENHANCED: Rejected with specific false positive error
+            # (model incorrectly sees sarcasm where there is none)
+            rejected = " Yes. This text seems sarcastic."
         
         dpo_data.append({
             'prompt': prompt,
@@ -132,13 +175,14 @@ def train_dpo(csv_path, output_dir="./qwen_sarcasm_dpo", adapter_path=None):
     # For newer TRL versions, we need a reference model
     ref_model = None  # DPOTrainer will create a copy if needed
     
-    # DPO Configuration (using DPOConfig for TRL v0.25+)
+    # ENHANCED DPO Configuration
+    # Key changes: Higher beta (0.1 → 0.5) for stronger preference learning
     training_args = DPOConfig(
         output_dir=output_dir,
         num_train_epochs=3,
         per_device_train_batch_size=1,  # Reduced for memory
         per_device_eval_batch_size=1,
-        gradient_accumulation_steps=16,  # Increased to maintain effective batch
+        gradient_accumulation_steps=16,  # Maintain effective batch size
         learning_rate=5e-5,
         warmup_steps=50,
         logging_steps=25,
@@ -150,9 +194,10 @@ def train_dpo(csv_path, output_dir="./qwen_sarcasm_dpo", adapter_path=None):
         report_to="none",
         remove_unused_columns=False,
         gradient_checkpointing=True,
-        max_length=384,  # Max sequence length for DPO
-        max_prompt_length=256,  # Max prompt length for DPO
-        beta=0.1,  # DPO temperature parameter
+        max_length=512,  # Increased to accommodate richer responses
+        max_prompt_length=256,
+        beta=0.5,  # ENHANCED: Increased from 0.1 to 0.5 for stronger preference signal
+        # Higher beta = model learns more aggressively from preference differences
     )
     
     # DPO Trainer (updated for TRL v0.25+)
@@ -180,7 +225,7 @@ def main():
     # PHASE 2: DPO on iSarcasm dataset
     isarcasm_path = "data/isarcasm2022.csv"
     sft_adapter_path = "./qwen_sarc_sft"  # From Phase 1 SFT
-    output_dir = "./qwen_sarcasm_dpo"
+    output_dir = "./qwen_sarcasm_dpo_enhanced"  # Enhanced version with richer preferences
     
     print("="*70)
     print("PHASE 2: Direct Preference Optimization on iSarcasm Dataset")
