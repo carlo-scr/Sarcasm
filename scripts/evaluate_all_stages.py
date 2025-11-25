@@ -21,13 +21,25 @@ def load_model_and_tokenizer(model_path, is_adapter=False, base_model_name="Qwen
     """Load model and tokenizer. Handles both base models and LoRA adapters."""
     print(f"Loading model from: {model_path}")
     
+    # Auto-detect optimal dtype
+    if torch.cuda.is_available():
+        dtype = torch.float16
+        device_info = f"CUDA ({torch.cuda.get_device_name(0)})"
+    elif torch.backends.mps.is_available():
+        dtype = torch.float32
+        device_info = "MPS"
+    else:
+        dtype = torch.float32
+        device_info = "CPU"
+    print(f"  Device: {device_info}")
+    
     tokenizer = AutoTokenizer.from_pretrained(base_model_name if is_adapter else model_path)
     
     if is_adapter and os.path.exists(model_path):
         # Load base model then adapter
         base_model = AutoModelForCausalLM.from_pretrained(
             base_model_name,
-            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            torch_dtype=dtype,
             device_map="auto"
         )
         model = PeftModel.from_pretrained(base_model, model_path)
@@ -36,7 +48,7 @@ def load_model_and_tokenizer(model_path, is_adapter=False, base_model_name="Qwen
         # Load regular model
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
-            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            torch_dtype=dtype,
             device_map="auto"
         )
     

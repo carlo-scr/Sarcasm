@@ -102,12 +102,23 @@ def load_model_for_dpo(base_model_name="Qwen/Qwen2.5-0.5B-Instruct", adapter_pat
     """Load model and apply LoRA if adapter path provided."""
     print(f"Loading model: {base_model_name}")
     
+    # Auto-detect device and set optimal dtype
+    if torch.cuda.is_available():
+        dtype = torch.float16  # Faster on CUDA
+        print("  Device: CUDA (using float16)")
+    elif torch.backends.mps.is_available():
+        dtype = torch.float32  # MPS compatibility
+        print("  Device: MPS (using float32)")
+    else:
+        dtype = torch.float32  # CPU fallback
+        print("  Device: CPU (using float32)")
+    
     tokenizer = AutoTokenizer.from_pretrained(base_model_name)
     tokenizer.pad_token = tokenizer.eos_token
     
     model = AutoModelForCausalLM.from_pretrained(
         base_model_name,
-        dtype=torch.float32,  # Changed from torch_dtype to dtype
+        torch_dtype=dtype,
         device_map="auto"
     )
     
@@ -152,6 +163,10 @@ def train_dpo(csv_path, output_dir="./qwen_sarcasm_dpo", adapter_path=None):
     
     # ENHANCED DPO Configuration
     # Key changes: Higher beta (0.1 → 0.5) for stronger preference learning
+    # Auto-detect bf16/fp16 support
+    use_bf16 = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8  # A100/H100
+    use_fp16 = torch.cuda.is_available() and not use_bf16  # Other CUDA GPUs (T4, V100)
+    
     training_args = DPOConfig(
         output_dir=output_dir,
         num_train_epochs=3,
@@ -165,7 +180,8 @@ def train_dpo(csv_path, output_dir="./qwen_sarcasm_dpo", adapter_path=None):
         eval_steps=100,
         save_steps=100,
         save_total_limit=1,
-        bf16=False,  # Disable for MPS
+        bf16=use_bf16,  # Auto-enable for A100/H100
+        fp16=use_fp16,  # Auto-enable for T4/V100
         report_to="none",
         remove_unused_columns=False,
         gradient_checkpointing=True,
