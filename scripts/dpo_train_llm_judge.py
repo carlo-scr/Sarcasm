@@ -30,7 +30,8 @@ def load_judge_model(judge_model_name="mistralai/Mistral-7B-Instruct-v0.1"):
     model = AutoModelForCausalLM.from_pretrained(
         judge_model_name,
         torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-        device_map="auto"
+        device_map="auto",
+        load_in_8bit=True,
     )
     
     return model, tokenizer
