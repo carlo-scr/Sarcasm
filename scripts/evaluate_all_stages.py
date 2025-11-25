@@ -173,28 +173,17 @@ def main():
     print("="*70)
     print("COMPARATIVE MODEL EVALUATION")
     print("="*70)
-    print("\nLoading iSarcasm test dataset...")
-    df = pd.read_csv('data/isarcasm2022.csv', index_col=0)
     
-    # Load test indices from DPO training (to avoid data leakage)
-    if os.path.exists('isarcasm_test_indices.json'):
-        print("Loading test indices from DPO training split...")
-        with open('isarcasm_test_indices.json', 'r') as f:
-            test_indices = json.load(f)
-        df_test = df.loc[test_indices]
-        print("✓ Using held-out test set (not used in DPO training)")
-    else:
-        # Fallback: Create STRATIFIED test split to ensure balanced classes
-        print("⚠️  Test indices not found. Creating new split (may overlap with DPO training).")
-        from sklearn.model_selection import train_test_split
-        _, df_test = train_test_split(
-            df, 
-            test_size=0.2, 
-            random_state=42,
-            stratify=df['sarcastic']  # Ensures both classes are represented
-        )
+    test_csv_path = 'data/splits/isarcasm_test.csv'
+    print(f"\nLoading held-out test set from: {test_csv_path}")
     
-    print(f"Test set: {len(df_test)} samples (stratified split)")
+    if not os.path.exists(test_csv_path):
+        print(f"❌ Test split not found at {test_csv_path}")
+        print("   Run 'python create_splits.py' first to create train/test splits.")
+        return
+    
+    df_test = pd.read_csv(test_csv_path, index_col=0)
+    print(f"✓ Test set: {len(df_test)} samples")
     print(f"  Sarcastic: {df_test['sarcastic'].sum()} ({df_test['sarcastic'].mean():.1%})")
     print(f"  Non-sarcastic: {len(df_test) - df_test['sarcastic'].sum()} ({1-df_test['sarcastic'].mean():.1%})")
     
@@ -205,41 +194,27 @@ def main():
     print(f"\n{'='*70}")
     print("STAGE 1: Base Model (Zero-shot)")
     print("="*70)
-    if os.path.exists('results_base_model.json'):
-        print("⚠️  Base model results already exist. Loading from cache...")
-        with open('results_base_model.json', 'r') as f:
-            results_base = json.load(f)
+    try:
+        model, tokenizer = load_model_and_tokenizer(base_model_name, is_adapter=False)
+        results_base, _ = evaluate_model(model, tokenizer, df_test, "Base Model (Zero-shot)")
         all_results.append(results_base)
-    else:
-        try:
-            model, tokenizer = load_model_and_tokenizer(base_model_name, is_adapter=False)
-            results_base, _ = evaluate_model(model, tokenizer, df_test, "Base Model (Zero-shot)")
-            all_results.append(results_base)
-            
-            # Save intermediate result
-            with open('results_base_model.json', 'w') as f:
-                json.dump(results_base, f, indent=2)
-            
-            # Free memory
-            del model
-            torch.cuda.empty_cache() if torch.cuda.is_available() else None
-        except Exception as e:
-            print(f"❌ Could not evaluate base model: {e}")
+        
+        # Free memory
+        del model
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    except Exception as e:
+        print(f"❌ Could not evaluate base model: {e}")
     
     # Stage 2: After SFT
     print(f"\n{'='*70}")
     print("STAGE 2: After SFT (Phase 1 - SARC training)")
     print("="*70)
-    sft_path = "./qwen_sarc_sft"
+    sft_path = "models/sft"
     if os.path.exists(sft_path):
         try:
             model, tokenizer = load_model_and_tokenizer(sft_path, is_adapter=True, base_model_name=base_model_name)
             results_sft, _ = evaluate_model(model, tokenizer, df_test, "SFT Model (SARC)")
             all_results.append(results_sft)
-            
-            # Save intermediate result
-            with open('results_sft_model.json', 'w') as f:
-                json.dump(results_sft, f, indent=2)
             
             del model
             torch.cuda.empty_cache() if torch.cuda.is_available() else None
@@ -253,16 +228,12 @@ def main():
     print(f"\n{'='*70}")
     print("STAGE 3: After DPO (Phase 2 - iSarcasm refinement)")
     print("="*70)
-    dpo_path = "./qwen_sarcasm_dpo"
+    dpo_path = "models/dpo_enhanced"
     if os.path.exists(dpo_path):
         try:
             model, tokenizer = load_model_and_tokenizer(dpo_path, is_adapter=True, base_model_name=base_model_name)
-            results_dpo, _ = evaluate_model(model, tokenizer, df_test, "DPO Model (iSarcasm)")
+            results_dpo, _ = evaluate_model(model, tokenizer, df_test, "DPO Model (iSarcasm Enhanced)")
             all_results.append(results_dpo)
-            
-            # Save intermediate result
-            with open('results_dpo_model.json', 'w') as f:
-                json.dump(results_dpo, f, indent=2)
             
             del model
             torch.cuda.empty_cache() if torch.cuda.is_available() else None
@@ -308,8 +279,7 @@ def main():
         with open('comparative_results.json', 'w') as f:
             json.dump(comparison, f, indent=2)
         
-        print(f"\n✓ All results saved to comparative_results.json")
-        print(f"✓ Individual results saved to results_*_model.json")
+        print(f"\n✓ Results saved to comparative_results.json")
     else:
         print("No models were evaluated. Please train models first.")
     

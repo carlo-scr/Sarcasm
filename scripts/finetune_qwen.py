@@ -175,7 +175,7 @@ def main():
     
     # PHASE 1: Train on SARC dataset (large volume for pattern learning)
     sarc_path = "data/SARC/train-balanced-sarcasm.csv"
-    output_dir = "./qwen_sarc_sft"
+    output_dir = "models/sft"
     
     print("="*70)
     print("PHASE 1: Supervised Fine-Tuning on SARC Dataset")

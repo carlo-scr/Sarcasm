@@ -21,47 +21,22 @@ from datasets import Dataset
 from peft import LoraConfig, get_peft_model, PeftModel
 from trl import DPOTrainer, DPOConfig
 import json 
-from sklearn.model_selection import train_test_split
-
-def prepare_dpo_dataset(csv_path, train_only=True):
+def prepare_dpo_dataset(train_csv_path):
     """
-    ENHANCED: Prepare iSarcasm dataset with stronger, more informative preference pairs.
-    
-    Improvements:
-    1. Richer reasoning in chosen responses
-    2. More specific rejection reasons (common error patterns)
-    3. Confidence levels based on number of sarcasm indicators
+    Prepare iSarcasm TRAINING dataset with enhanced preference pairs.
     
     Args:
-        csv_path: Path to iSarcasm CSV file
-        train_only: If True, return only the training split (80%). If False, return full dataset.
+        train_csv_path: Path to training split CSV (data/splits/isarcasm_train.csv)
+    
+    Returns:
+        Dataset with prompt/chosen/rejected pairs
     """
-    print(f"Loading iSarcasm dataset for DPO from: {csv_path}")
-    df = pd.read_csv(csv_path, index_col=0)
+    print(f"Loading iSarcasm training data from: {train_csv_path}")
+    df = pd.read_csv(train_csv_path, index_col=0)
     
-    # Split into train (80%) and test (20%) with stratification
-    df_train, df_test = train_test_split(
-        df, 
-        test_size=0.2, 
-        random_state=42,
-        stratify=df['sarcastic']
-    )
-    
-    # Save test set indices for evaluation script to use
-    test_indices = df_test.index.tolist()
-    with open('isarcasm_test_indices.json', 'w') as f:
-        json.dump(test_indices, f)
-    print(f"Saved {len(test_indices)} test indices to isarcasm_test_indices.json")
-    
-    # Use only training split for DPO
-    if train_only:
-        df = df_train
-        print(f"\nUsing TRAIN split for DPO training:")
-    else:
-        print(f"\nUsing FULL dataset (not recommended - causes data leakage):")
-    
-    print(f"Total samples: {len(df)}")
-    print(f"Sarcastic: {df['sarcastic'].sum()}, Non-sarcastic: {len(df) - df['sarcastic'].sum()}")
+    print(f"Training samples: {len(df)}")
+    print(f"  Sarcastic: {df['sarcastic'].sum()} ({df['sarcastic'].mean():.1%})")
+    print(f"  Non-sarcastic: {len(df) - df['sarcastic'].sum()} ({1-df['sarcastic'].mean():.1%})")
     
     dpo_data = []
     
@@ -223,20 +198,21 @@ def train_dpo(csv_path, output_dir="./qwen_sarcasm_dpo", adapter_path=None):
 
 def main():
     # PHASE 2: DPO on iSarcasm dataset
-    isarcasm_path = "data/isarcasm2022.csv"
-    sft_adapter_path = "./qwen_sarc_sft"  # From Phase 1 SFT
-    output_dir = "./qwen_sarcasm_dpo_enhanced"  # Enhanced version with richer preferences
+    train_csv_path = "data/splits/isarcasm_train.csv"  # Pre-split training data
+    sft_adapter_path = "models/sft"  # From Phase 1 SFT
+    output_dir = "models/dpo_enhanced"  # Enhanced version
     
     print("="*70)
-    print("PHASE 2: Direct Preference Optimization on iSarcasm Dataset")
+    print("PHASE 2: Direct Preference Optimization (DPO)")
     print("="*70)
-    print("Strategy: Refine SARC-trained model with high-quality iSarcasm preferences")
-    print(f"Loading SFT checkpoint from: {sft_adapter_path}")
+    print("Strategy: Refine SARC-trained model with iSarcasm preferences")
+    print(f"Training data: {train_csv_path}")
+    print(f"Base model: {sft_adapter_path}")
     print("="*70)
     
     # Train DPO starting from SARC SFT model
     train_dpo(
-        isarcasm_path, 
+        train_csv_path, 
         output_dir=output_dir, 
         adapter_path=sft_adapter_path
     )
