@@ -20,7 +20,7 @@ from trl import DPOTrainer, DPOConfig
 import json 
 from tqdm import tqdm
 
-def load_judge_model(judge_model_name="mistralai/Mistral-7B-Instruct-v0.1"):
+def load_judge_model(judge_model_name="Qwen/Qwen2.5-1.5B-Instruct"):
     """Load a larger LLM to serve as judge."""
     print(f"Loading judge model: {judge_model_name}")
     
@@ -409,7 +409,7 @@ def main():
     train_csv_path = "data/splits/isarcasm_train.csv"
     sft_adapter_path = "models/sft"
     output_dir = "models/dpo_judge"
-    judge_model_name = "mistralai/Mistral-7B-Instruct-v0.1"  # Open-source, no auth required
+    judge_model_name = "Qwen/Qwen2.5-1.5B-Instruct"  # Much faster than Mistral-7B
     
     # Load models
     print("\nLoading models...")
