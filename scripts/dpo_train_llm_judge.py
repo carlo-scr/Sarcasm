@@ -1,454 +1,536 @@
-"""
-Direct Preference Optimization (DPO) with LLM Judge - Phase 2 Alternative.
-This script uses a larger LLM to judge model-generated responses and create preferences.
-
-APPROACH:
-1. Small model generates multiple candidate responses for each tweet
-2. Judge LLM evaluates which response is better
-3. Use judge's rankings to create DPO preference pairs
-4. Train small model to align with judge's preferences
-
-This explores if using an LLM judge leads to better generalization than ground truth labels.
-"""
-
 import pandas as pd
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from datasets import Dataset 
-from peft import LoraConfig, get_peft_model, PeftModel
-from trl import DPOTrainer, DPOConfig
-import json 
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from peft import PeftModel
 from tqdm import tqdm
+from huggingface_hub import InferenceClient
+import re
+import os
 
-def load_judge_model(judge_model_name="Qwen/Qwen2.5-1.5B-Instruct"):
-    """Load a larger LLM to serve as judge."""
-    print(f"Loading judge model: {judge_model_name}")
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+BASE_MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
+SFT_MODEL_PATH = "models/sft"  # The model we'll generate TWO responses from
+JUDGE_MODEL_NAME = "HuggingFaceH4/zephyr-7b-beta"
+SAMPLE_SIZE = 50
+
+# ============================================================================
+# STEP 1: INITIALIZE JUDGE MODEL
+# ============================================================================
+
+def load_judge_model(model_name=JUDGE_MODEL_NAME, hf_token=None):
+    """Initialize the judge model via Hugging Face Inference API."""
+    print(f"🔧 Initializing judge model: {model_name}")
     
-    tokenizer = AutoTokenizer.from_pretrained(judge_model_name)
-    tokenizer.pad_token = tokenizer.eos_token
+    if hf_token is None:
+        raise ValueError("Please provide your HuggingFace API token!")
     
-    model = AutoModelForCausalLM.from_pretrained(
-        judge_model_name,
-        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-        device_map="auto",
-        load_in_8bit=True,
+    client = InferenceClient(token=hf_token)
+    print("✓ Judge model ready\n")
+    
+    return client, model_name
+
+
+# ============================================================================
+# STEP 2: LOAD THE MODEL THAT WILL GENERATE PREFERENCE PAIRS
+# ============================================================================
+
+def load_candidate_model(model_path, is_adapter=False, base_model_name=BASE_MODEL_NAME):
+    """Load the model that will generate multiple responses."""
+    print(f"  Loading model from: {model_path}")
+    
+    tokenizer = AutoTokenizer.from_pretrained(
+        base_model_name if is_adapter else model_path
     )
     
+    if is_adapter and os.path.exists(model_path):
+        base_model = AutoModelForCausalLM.from_pretrained(
+            base_model_name,
+            torch_dtype=torch.float16,
+            device_map="auto"
+        )
+        model = PeftModel.from_pretrained(base_model, model_path)
+        model = model.merge_and_unload()
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch.float16,
+            device_map="auto"
+        )
+    
+    model.eval()
     return model, tokenizer
 
-def load_small_model(base_model_name="Qwen/Qwen2.5-0.5B-Instruct", adapter_path=None):
-    """Load the small model for generating candidates."""
-    print(f"Loading small model: {base_model_name}")
-    
-    tokenizer = AutoTokenizer.from_pretrained(base_model_name)
-    tokenizer.pad_token = tokenizer.eos_token
-    
-    model = AutoModelForCausalLM.from_pretrained(
-        base_model_name,
-        torch_dtype=torch.float32,
-        device_map="auto"
-    )
-    
-    if adapter_path:
-        print(f"Loading adapter from: {adapter_path}")
-        model = PeftModel.from_pretrained(model, adapter_path)
-    
-    return model, tokenizer
 
-def generate_candidate_responses(small_model, tokenizer, text, num_candidates=2):
-    """Generate multiple candidate responses from the small model."""
+# ============================================================================
+# STEP 3: GENERATE TWO DIFFERENT RESPONSES FROM THE SAME MODEL
+# ============================================================================
+
+def generate_response(model, tokenizer, text, max_new_tokens=100, temperature=0.7, seed=None):
+    """
+    Generate a single response from the model.
+    
+    Args:
+        model: The language model
+        tokenizer: Model's tokenizer
+        text: Input text to analyze
+        max_new_tokens: Maximum tokens to generate
+        temperature: Sampling temperature (higher = more diverse)
+        seed: Random seed for reproducibility
+    
+    Returns:
+        str: Model's response
+    """
     messages = [
-        {"role": "user", "content": f"Is the following text sarcastic?\n\nText: {text}\n\nAnswer:"}
+        {"role": "user", "content": f"""Is the following text sarcastic? Sarcasm often involves irony, exaggeration, or saying the opposite of what is meant. 
+Answer with 'Yes' or 'No' in the first line. Then, briefly explain your reasoning.
+
+Text: {text}
+
+Answer:"""}
     ]
     
     try:
         prompt = tokenizer.apply_chat_template(
             messages,
             tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=False
-        )
-    except TypeError:
-        prompt = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
             add_generation_prompt=True
         )
+    except:
+        prompt = messages[0]['content']
     
-    candidates = []
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     
-    for i in range(num_candidates):
-        inputs = tokenizer(prompt, return_tensors="pt").to(small_model.device)
-        
-        with torch.no_grad():
-            outputs = small_model.generate(
-                **inputs,
-                max_new_tokens=100,
-                temperature=0.7 + (i * 0.1),  # Vary temperature for diversity
-                top_p=0.8,
-                top_k=20,
-                do_sample=True,
-                pad_token_id=tokenizer.eos_token_id
-            )
-        
-        response = tokenizer.decode(outputs[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True)
-        response = response.strip()
-        
-        # Remove thinking tags if present
-        if '</think>' in response:
-            response = response.split('</think>')[-1].strip()
-        
-        candidates.append(response)
-    
-    return candidates
-
-def extract_label(response):
-    """Extract 'Yes' or 'No' label from response."""
-    response_lower = response.lower()
-    if 'yes' in response_lower:
-        return 1
-    elif 'no' in response_lower:
-        return 0
-    else:
-        return -1  # Unclear
-
-def judge_responses(judge_model, judge_tokenizer, text, response_a, response_b):
-    """Use judge LLM to rank two responses."""
-    judge_prompt = f"""You are an expert judge. Compare two responses to a sarcasm detection question.
-
-Question: Is the following text sarcastic? Answer with 'Yes' or 'No'.
-Text: {text}
-
-Response A: {response_a}
-Response B: {response_b}
-
-Which response is better? Respond with only 'A' or 'B'."""
-    
-    messages = [{"role": "user", "content": judge_prompt}]
-    
-    try:
-        prompt = judge_tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=False
-        )
-    except TypeError:
-        prompt = judge_tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True
-        )
-    
-    inputs = judge_tokenizer(prompt, return_tensors="pt").to(judge_model.device)
+    # Set seed for reproducibility if provided
+    if seed is not None:
+        torch.manual_seed(seed)
     
     with torch.no_grad():
-        outputs = judge_model.generate(
+        outputs = model.generate(
             **inputs,
-            max_new_tokens=10,
-            temperature=0.2,
-            do_sample=False,
-            pad_token_id=judge_tokenizer.eos_token_id
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=0.9,
+            do_sample=True,  # IMPORTANT: Must be True to get different outputs
+            pad_token_id=tokenizer.eos_token_id
         )
     
-    judgment = judge_tokenizer.decode(outputs[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True)
-    judgment = judgment.strip().upper()
-    
-    if 'A' in judgment:
-        return 'A'
-    elif 'B' in judgment:
-        return 'B'
-    else:
-        return 'A'  # Default to A if unclear
+    response = tokenizer.decode(
+        outputs[0][inputs['input_ids'].shape[1]:], 
+        skip_special_tokens=True
+    )
+    return response.strip()
 
-def prepare_dpo_dataset_with_judge(train_csv_path, small_model, small_tokenizer, judge_model, judge_tokenizer, num_candidates=2):
+
+def generate_response_pair(model, tokenizer, text, max_new_tokens=100):
     """
-    Prepare DPO dataset using LLM judge to rank model-generated responses.
-    Also tracks judge accuracy, F1, precision, recall, and win rate.
+    Generate TWO different responses from the SAME model for DPO.
+    
+    THIS IS THE KEY FOR DPO:
+    - Same model, same prompt
+    - Different sampling = different outputs
+    - Judge picks which one is better
     
     Args:
-        train_csv_path: Path to training split CSV
-        small_model: Model to generate candidates
-        small_tokenizer: Tokenizer for small model
-        judge_model: LLM judge model
-        judge_tokenizer: Tokenizer for judge
-        num_candidates: Number of candidates to generate per sample
+        model: The language model
+        tokenizer: Model's tokenizer
+        text: Input text
+        max_new_tokens: Max tokens per response
     
     Returns:
-        Tuple of (Dataset with prompt/chosen/rejected pairs, metrics dict)
+        tuple: (response_1, response_2)
     """
-    print(f"Loading iSarcasm training data from: {train_csv_path}")
-    df = pd.read_csv(train_csv_path, index_col=0)
+    # Generate response 1 with temperature and seed
+    response_1 = generate_response(
+        model, tokenizer, text, 
+        max_new_tokens=max_new_tokens,
+        temperature=0.8,  # Higher temp for more diversity
+        seed=42
+    )
     
-    print(f"Training samples: {len(df)}")
-    print(f"  Sarcastic: {df['sarcastic'].sum()} ({df['sarcastic'].mean():.1%})")
-    print(f"  Non-sarcastic: {len(df) - df['sarcastic'].sum()} ({1-df['sarcastic'].mean():.1%})")
+    # Generate response 2 with different seed for different output
+    response_2 = generate_response(
+        model, tokenizer, text,
+        max_new_tokens=max_new_tokens, 
+        temperature=0.8,
+        seed=123  # Different seed = different response
+    )
     
-    dpo_data = []
-    
-    # Metrics tracking
-    judge_correct = 0
-    judge_total = 0
-    true_positives = 0
-    false_positives = 0
-    true_negatives = 0
-    false_negatives = 0
-    judge_picks_correct = 0  # Win rate: how often judge picks the correct answer
-    
-    print(f"\nGenerating candidates and judge rankings...")
-    for idx, row in tqdm(df.iterrows(), total=len(df), desc="Judge ranking"):
-        text = row['tweet']
-        ground_truth_label = row['sarcastic']
-        
-        # Create prompt
-        prompt = f"""Is the following text sarcastic? Sarcasm often involves irony, exaggeration, or saying the opposite of what is meant.
+    return response_1, response_2
 
-Text: {text}
 
-Answer:"""
+def collect_preference_pairs(df_sample, model, tokenizer):
+    """
+    Collect preference pairs for DPO training.
+    
+    For each sample:
+    1. Generate response A from the model
+    2. Generate response B from the SAME model (different sampling)
+    3. Later, judge will pick which is better (preferred vs rejected)
+    
+    Args:
+        df_sample: DataFrame with test samples
+        model: The model to generate responses
+        tokenizer: Model's tokenizer
+    
+    Returns:
+        list: List of dicts with paired responses
+    """
+    preference_pairs = []
+    
+    print(f"\n{'='*70}")
+    print("🎲 Generating response pairs for DPO")
+    print(f"{'='*70}")
+    
+    for idx, row in tqdm(df_sample.iterrows(), total=len(df_sample), desc="Generating Pairs"):
+        # Generate TWO different responses from the same model
+        response_a, response_b = generate_response_pair(model, tokenizer, row['tweet'])
         
-        # Generate candidates
-        candidates = generate_candidate_responses(small_model, small_tokenizer, text, num_candidates=num_candidates)
-        
-        # Skip if we don't have at least 2 candidates
-        if len(candidates) < 2:
-            continue
-        
-        # Extract labels from candidates
-        labels = [extract_label(cand) for cand in candidates]
-        
-        # Judge the candidates
-        chosen_idx = 0  # Default to first candidate
-        rejected_idx = 1
-        
-        if len(candidates) >= 2:
-            judgment = judge_responses(judge_model, judge_tokenizer, text, candidates[0], candidates[1])
-            if judgment == 'B':
-                chosen_idx = 1
-                rejected_idx = 0
-        
-        # Extract labels
-        chosen_label = labels[chosen_idx]
-        rejected_label = labels[rejected_idx]
-        
-        # Track judge metrics
-        judge_total += 1
-        
-        # Did judge pick the correct answer?
-        if chosen_label == ground_truth_label and chosen_label != -1:
-            judge_picks_correct += 1
-            judge_correct += 1
-            # Count TP/TN
-            if chosen_label == 1:
-                true_positives += 1
-            else:
-                true_negatives += 1
-        elif chosen_label != -1:
-            # Count FP/FN
-            if chosen_label == 1:
-                false_positives += 1
-            else:
-                false_negatives += 1
-        
-        # Create preference pair (hybrid: correct answer + judge preference)
-        if chosen_label == ground_truth_label and chosen_label != -1:
-            # Judge picked the correct answer - make it the preferred choice
-            chosen = " " + candidates[chosen_idx]
-            rejected = " " + candidates[rejected_idx]
-        elif rejected_label == ground_truth_label and rejected_label != -1:
-            # Judge picked the wrong answer - swap them
-            chosen = " " + candidates[rejected_idx]
-            rejected = " " + candidates[chosen_idx]
-        else:
-            # Both or neither are clear - use judge's preference as tiebreaker
-            chosen = " " + candidates[chosen_idx]
-            rejected = " " + candidates[rejected_idx]
-        
-        dpo_data.append({
-            'prompt': prompt,
-            'chosen': chosen,
-            'rejected': rejected
+        # Store both responses - judge will decide which is better
+        preference_pairs.append({
+            'index': idx,
+            'prompt': row['tweet'],
+            'true_label': row['sarcastic'],
+            'response_a': response_a,
+            'response_b': response_b,
+            # These will be filled in by the judge
+            'preferred': None,
+            'rejected': None,
+            'winner': None,
+            'judge_reasoning': None
         })
     
-    print(f"Created {len(dpo_data)} DPO preference pairs (judge-ranked)")
-    
-    # Calculate metrics
-    precision = true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0
-    recall = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0
-    f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
-    accuracy = judge_correct / judge_total if judge_total > 0 else 0
-    win_rate = judge_picks_correct / judge_total if judge_total > 0 else 0
-    
-    metrics = {
-        'total_pairs': judge_total,
-        'accuracy': accuracy,
-        'precision': precision,
-        'recall': recall,
-        'f1_score': f1,
-        'win_rate': win_rate,
-        'true_positives': true_positives,
-        'false_positives': false_positives,
-        'true_negatives': true_negatives,
-        'false_negatives': false_negatives,
-        'correct_choices': judge_picks_correct
-    }
-    
-    print("\nJudge Performance Metrics:")
-    print(f"  Total pairs: {metrics['total_pairs']}")
-    print(f"  Accuracy: {metrics['accuracy']:.2%}")
-    print(f"  Precision: {metrics['precision']:.2%}")
-    print(f"  Recall: {metrics['recall']:.2%}")
-    print(f"  F1 Score: {metrics['f1_score']:.2%}")
-    print(f"  Win Rate (picks correct answer): {metrics['win_rate']:.2%}")
-    print(f"  TP: {metrics['true_positives']}, FP: {metrics['false_positives']}")
-    print(f"  TN: {metrics['true_negatives']}, FN: {metrics['false_negatives']}")
-    
-    return Dataset.from_list(dpo_data), metrics
+    return preference_pairs
 
-def load_model_for_dpo(base_model_name="Qwen/Qwen2.5-0.5B-Instruct", adapter_path=None):
-    """Load model and apply LoRA if adapter path provided."""
-    print(f"Loading model for DPO: {base_model_name}")
+
+# ============================================================================
+# STEP 4: CREATE JUDGE PROMPT FOR PREFERENCE SELECTION
+# ============================================================================
+
+def create_judge_prompt_for_dpo(text, true_label, response_a, response_b):
+    """
+    Create a prompt for the judge to pick the better response.
+    Label text is provided so the judge can prioritize correctness.
+    """
+    label_text = "sarcastic" if true_label == 1 else "not sarcastic"
     
-    tokenizer = AutoTokenizer.from_pretrained(base_model_name)
-    tokenizer.pad_token = tokenizer.eos_token
+    prompt = f"""You are an expert judge evaluating sarcasm detection responses.
+
+Text to analyze: "{text}"
+
+Ground truth: The text is {label_text}.
+
+Response A:
+{response_a}
+
+Response B:
+{response_b}
+
+Evaluation criteria (in order of importance):
+1. Correctness: The response's Yes/No decision must match the ground truth.
+2. Explanation quality: Clear, specific, and insightful reasoning.
+3. Confidence calibration and clarity.
+
+Instructions:
+- Do NOT choose a response that contradicts the ground truth label unless both are wrong.
+- If both are wrong, choose the one closer to correct and explain why.
+- First line MUST be exactly: "Winner: A", "Winner: B", or "Winner: Tie". Do not answer anything else in the first line.
+- On the next line, briefly explain your reasoning.
+
+Now provide your judgment.
+"""
+    return prompt
+
+
+
+# ============================================================================
+# STEP 5: GET JUDGE VERDICTS
+# ============================================================================
+
+def get_judge_verdict(judge_client, judge_model_name, prompt, max_tokens=300):
+    """Get the judge's verdict via Inference API."""
+    messages = [{"role": "user", "content": prompt}]
     
-    model = AutoModelForCausalLM.from_pretrained(
-        base_model_name,
-        dtype=torch.float32,
-        device_map="auto"
-    )
-    
-    # Load fine-tuned adapter if provided
-    if adapter_path:
-        print(f"Loading fine-tuned adapter from: {adapter_path}")
-        model = PeftModel.from_pretrained(model, adapter_path)
-    else:
-        # Apply fresh LoRA config
-        lora_config = LoraConfig(
-            r=16,
-            lora_alpha=32,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-            lora_dropout=0.05,
-            bias="none",
-            task_type="CAUSAL_LM"
+    try:
+        response = judge_client.chat_completion(
+            model=judge_model_name,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=0.3,
         )
-        model = get_peft_model(model, lora_config)
+        return response.choices[0].message.content.strip()
     
-    return model, tokenizer
+    except Exception as e:
+        print(f"⚠️ Error getting judge verdict: {e}")
+        return None
 
-def train_dpo(dataset, metrics, output_dir="./qwen_sarcasm_dpo_judge", base_model_name="Qwen/Qwen2.5-0.5B-Instruct", adapter_path=None):
-    """Train model using DPO with judge-ranked preferences."""
-    
-    # Split train/val
-    split_dataset = dataset.train_test_split(test_size=0.1, seed=42)
-    train_dataset = split_dataset['train']
-    eval_dataset = split_dataset['test']
-    
-    print(f"Training samples: {len(train_dataset)}")
-    print(f"Evaluation samples: {len(eval_dataset)}")
-    
-    # Load model
-    model, tokenizer = load_model_for_dpo(base_model_name=base_model_name, adapter_path=adapter_path)
-    
-    ref_model = None
-    
-    # DPO Configuration (same as before)
-    training_args = DPOConfig(
-        output_dir=output_dir,
-        num_train_epochs=3,
-        per_device_train_batch_size=1,
-        per_device_eval_batch_size=1,
-        gradient_accumulation_steps=16,
-        learning_rate=5e-5,
-        warmup_steps=50,
-        logging_steps=25,
-        eval_strategy="steps",
-        eval_steps=100,
-        save_steps=100,
-        save_total_limit=1,
-        bf16=False,
-        report_to="none",
-        remove_unused_columns=False,
-        gradient_checkpointing=True,
-        max_length=512,
-        max_prompt_length=256,
-        beta=0.5,
-    )
-    
-    dpo_trainer = DPOTrainer(
-        model=model,
-        ref_model=ref_model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        processing_class=tokenizer,
-    )
-    
-    print("\nStarting DPO training with judge-ranked preferences...")
-    dpo_trainer.train()
-    
-    print(f"\nSaving DPO model to {output_dir}")
-    dpo_trainer.save_model(output_dir)
-    tokenizer.save_pretrained(output_dir)
-    
-    # Save judge metrics
-    metrics_file = f"{output_dir}/judge_metrics.json"
-    with open(metrics_file, 'w') as f:
-        json.dump(metrics, f, indent=2)
-    print(f"Saved judge metrics to {metrics_file}")
-    
-    return dpo_trainer
 
-def main():
-    print("="*70)
-    print("PHASE 2: DPO with LLM Judge")
-    print("="*70)
-    print("Strategy: Use judge LLM to rank model-generated responses")
-    print("="*70)
+def parse_judge_verdict(verdict_text):
+    """
+    Parse the judge's verdict to extract winner.
     
-    train_csv_path = "data/splits/isarcasm_train.csv"
-    sft_adapter_path = "models/sft"
-    output_dir = "models/dpo_judge"
-    judge_model_name = "Qwen/Qwen2.5-1.5B-Instruct"  # Much faster than Mistral-7B
+    Returns:
+        str: 'A', 'B', 'Tie', or 'Error'
+    """
+    if verdict_text is None:
+        return 'Error'
     
-    # Load models
-    print("\nLoading models...")
-    small_model, small_tokenizer = load_small_model(adapter_path=sft_adapter_path)
-    judge_model, judge_tokenizer = load_judge_model(judge_model_name)
+    verdict_lower = verdict_text.lower()
     
-    # Prepare dataset with judge
-    print("\nPreparing dataset with judge rankings...")
-    dataset, judge_metrics = prepare_dpo_dataset_with_judge(
-        train_csv_path,
-        small_model,
-        small_tokenizer,
-        judge_model,
-        judge_tokenizer,
-        num_candidates=2
-    )
+    # Method 1: Regex
+    winner_match = re.search(r'winner:\s*(a|b|tie)', verdict_lower)
+    if winner_match:
+        result = winner_match.group(1).upper()
+        return 'Tie' if result == 'TIE' else result
     
-    # Free GPU memory from generation models
-    del small_model, judge_model
-    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    # Method 2: Explicit patterns
+    if 'winner: a' in verdict_lower or 'winner:a' in verdict_lower:
+        return 'A'
+    elif 'winner: b' in verdict_lower or 'winner:b' in verdict_lower:
+        return 'B'
+    elif 'winner: tie' in verdict_lower or 'winner:tie' in verdict_lower:
+        return 'Tie'
     
-    # Train DPO
-    train_dpo(
-        dataset,
-        judge_metrics,
-        output_dir=output_dir,
-        adapter_path=sft_adapter_path
-    )
+    # Method 3: Fallback
+    first_part = verdict_lower[:150]
+    has_a = 'response a' in first_part
+    has_b = 'response b' in first_part
     
-    print("\n" + "="*70)
-    print("Training Complete!")
-    print("="*70)
-    print(f"Judge-based DPO model saved to: {output_dir}")
-    print(f"Judge metrics saved to: {output_dir}/judge_metrics.json")
-    print("\nComparison:")
-    print("  Ground truth DPO: models/dpo_enhanced")
-    print("  Judge-based DPO: models/dpo_judge")
-    print("\nRun evaluate_all_stages.py to compare performance")
-    print("="*70)
+    if has_a and not has_b:
+        return 'A'
+    elif has_b and not has_a:
+        return 'B'
+    
+    print(f"⚠️ Unclear verdict: {verdict_text[:100]}")
+    return 'Tie'
+
+
+# ============================================================================
+# STEP 6: JUDGE ALL PREFERENCE PAIRS
+# ============================================================================
+
+import random
+
+def judge_preference_pairs(preference_pairs, judge_client, judge_model_name):
+    """
+    Have the judge evaluate all preference pairs.
+
+    This creates the labeled data for DPO:
+    - preferred: The better response (chosen by judge)
+    - rejected: The worse response (not chosen by judge)
+    """
+    print(f"\n{'='*70}")
+    print("⚖️  Judge evaluating preference pairs")
+    print(f"{'='*70}")
+    
+    judged_pairs = []
+    
+    for pair in tqdm(preference_pairs, desc="Judge Evaluating"):
+        # Randomize which response is shown as A vs B to reduce position bias
+        if random.random() < 0.5:
+            shown_a = pair['response_a']
+            shown_b = pair['response_b']
+            swapped = False
+        else:
+            shown_a = pair['response_b']
+            shown_b = pair['response_a']
+            swapped = True
+        
+        # Create comparison prompt with possibly swapped A/B
+        prompt = create_judge_prompt_for_dpo(
+            pair['prompt'],
+            pair['true_label'],
+            shown_a,
+            shown_b
+        )
+        
+        # Get judge's verdict
+        verdict = get_judge_verdict(judge_client, judge_model_name, prompt)
+        winner = parse_judge_verdict(verdict)
+        
+        # Map winner back to original responses, taking swapping into account
+        if winner == 'A':
+            preferred = pair['response_b'] if swapped else pair['response_a']
+            rejected  = pair['response_a'] if swapped else pair['response_b']
+        elif winner == 'B':
+            preferred = pair['response_a'] if swapped else pair['response_b']
+            rejected  = pair['response_b'] if swapped else pair['response_a']
+        else:
+            # Winner == 'Tie' or 'Error' -> keep but mark explicitly
+            preferred = None
+            rejected = None
+        
+        judged_pairs.append({
+            'index': pair['index'],
+            'prompt': pair['prompt'],
+            'true_label': pair['true_label'],
+            'response_a': pair['response_a'],
+            'response_b': pair['response_b'],
+            'winner': winner,
+            'preferred': preferred,
+            'rejected': rejected,
+            'swapped': swapped,
+            'judge_reasoning': verdict
+        })
+    
+    return judged_pairs
+
+
+# ============================================================================
+# STEP 7: CREATE DPO TRAINING DATASET
+# ============================================================================
+
+def extract_binary_label_from_response(response_text):
+    """
+    Extract a binary prediction (1 = sarcastic, 0 = not sarcastic) from a model response.
+    Very simple heuristic: look for leading 'yes'/'no'.
+    """
+    if response_text is None:
+        return None
+    text = response_text.strip().lower()
+    # look only at the first few characters / words
+    first = text[:30]
+    if "yes" in first:
+        return 1
+    if "no" in first:
+        return 0
+    return None
+
+
+def create_dpo_dataset(judged_pairs, filter_ties=True):
+    """
+    Convert judged pairs into DPO training format.
+    Also log whether preferred prediction matches the ground truth.
+    """
+    dpo_data = []
+    
+    for pair in judged_pairs:
+        # Skip ties or errors if requested
+        if filter_ties and pair['winner'] in ['Tie', 'Error']:
+            continue
+        
+        if pair['winner'] not in ['A', 'B']:
+            continue
+        
+        preferred = pair['preferred']
+        rejected = pair['rejected']
+        if preferred is None or rejected is None:
+            continue
+        
+        # Optional: compute whether preferred response label matches ground truth
+        y_pref = extract_binary_label_from_response(preferred)
+        label_match = (y_pref == pair['true_label']) if y_pref is not None else None
+        
+        dpo_data.append({
+            'prompt': pair['prompt'],
+            'chosen': preferred,
+            'rejected': rejected,
+            'true_label': pair['true_label'],
+            'preferred_matches_label': label_match
+        })
+    
+    df_dpo = pd.DataFrame(dpo_data)
+    
+    print(f"\n{'='*70}")
+    print("📊 DPO Dataset Statistics")
+    print(f"{'='*70}")
+    print(f"Total judged pairs: {len(judged_pairs)}")
+    print(f"Used pairs (clear A/B winner): {len(df_dpo)}")
+    print(f"Ties: {len([p for p in judged_pairs if p['winner'] == 'Tie'])}")
+    print(f"Errors: {len([p for p in judged_pairs if p['winner'] == 'Error'])}")
+    if 'preferred_matches_label' in df_dpo.columns:
+        n_known = df_dpo['preferred_matches_label'].notnull().sum()
+        if n_known > 0:
+            acc = df_dpo['preferred_matches_label'].dropna().mean()
+            print(f"Judge-chosen responses matching label (on parsed cases): {acc:.3f}")
+    
+    return df_dpo
+
+
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+
+def generate_dpo_preference_data(hf_token, test_csv_path='data/splits/isarcasm_test.csv', 
+                                  model_path=SFT_MODEL_PATH, is_adapter=True):
+    """
+    Complete pipeline to generate DPO preference data.
+    
+    Steps:
+    1. Load your SFT model
+    2. Generate TWO responses per prompt
+    3. Have judge pick which is better
+    4. Create DPO training dataset
+    
+    Args:
+        hf_token: Your HuggingFace API token
+        test_csv_path: Path to test data
+        model_path: Path to your SFT model
+        is_adapter: Whether model is a LoRA adapter
+    
+    Returns:
+        tuple: (dpo_dataset, all_judged_pairs)
+    """
+    # Load test data
+    print("📁 Loading test data...")
+    df_test = pd.read_csv(test_csv_path, index_col=0)
+    
+    df_sample = df_test.sample(n=min(SAMPLE_SIZE, len(df_test)), random_state=42)
+    print(f"🎯 Generating preference pairs for {len(df_sample)} samples\n")
+    
+    # Initialize judge
+    judge_client, judge_model_name = load_judge_model(hf_token=hf_token)
+    
+    # Load the model that will generate pairs
+    print("🤖 Loading candidate model for response generation...")
+    model, tokenizer = load_candidate_model(model_path, is_adapter)
+    
+    # Generate response pairs
+    preference_pairs = collect_preference_pairs(df_sample, model, tokenizer)
+    
+    # Clean up model memory
+    del model, tokenizer
+    torch.cuda.empty_cache()
+    
+    # Have judge evaluate all pairs
+    judged_pairs = judge_preference_pairs(preference_pairs, judge_client, judge_model_name)
+    
+    # Create DPO dataset
+    df_dpo = create_dpo_dataset(judged_pairs, filter_ties=True)
+    
+    return df_dpo, judged_pairs
+
+
+# ============================================================================
+# USAGE EXAMPLE
+# ============================================================================
 
 if __name__ == "__main__":
-    main()
+    # Set your HuggingFace token
+    HF_TOKEN = os.environ.get("HF_TOKEN")
+    
+    # Generate DPO preference data
+    dpo_dataset, all_pairs = generate_dpo_preference_data(HF_TOKEN)
+    
+    # Save the DPO training dataset
+    dpo_dataset.to_csv('data/dpo_preferences_dt.csv', index=False)
+    print(f"\n💾 Saved DPO dataset: {len(dpo_dataset)} preference pairs")
+    
+    # Save all judged pairs for analysis
+    pd.DataFrame(all_pairs).to_csv('data/all_judged_pairs_dt.csv', index=False)
+    print(f"💾 Saved all judged pairs for analysis")
+    
+    # Display sample
+    print("\n📋 Sample DPO training data:")
+    pd.set_option('display.max_colwidth', None)
+    pd.set_option('display.max_rows', None)
+    print(dpo_dataset.head(3))
+    
+    print("\n✅ DPO preference data generation complete!")
+    print("\nNext steps:")
+    print("1. Use this data to train with DPO")
+    print("2. The 'chosen' responses are what the model should learn to prefer")
+    print("3. The 'rejected' responses are what it should learn to avoid")
