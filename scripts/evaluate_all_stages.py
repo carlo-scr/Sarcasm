@@ -89,19 +89,21 @@ def get_prediction(model, tokenizer, text, max_new_tokens=50):
         )
     
     response = tokenizer.decode(outputs[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True)
-    response = response.strip().lower()
+    response_clean = response.strip().lower()
     
     # Handle thinking tags if present
-    if '</think>' in response:
-        response = response.split('</think>')[-1].strip()
+    if '</think>' in response_clean:
+        response_clean = response_clean.split('</think>')[-1].strip()
     
     # Parse response
-    if 'yes' in response:
-        return 1
-    elif 'no' in response:
-        return 0
+    if 'yes' in response_clean:
+        prediction = 1
+    elif 'no' in response_clean:
+        prediction = 0
     else:
-        return -1
+        prediction = -1
+    
+    return prediction, response  # Return both prediction and raw response for debugging
 
 def evaluate_model(model, tokenizer, df, model_name, sample_size=None):
     """Evaluate a single model."""
@@ -122,12 +124,24 @@ def evaluate_model(model, tokenizer, df, model_name, sample_size=None):
     true_negatives = 0
     false_negatives = 0
     
+    # Debug: collect sample responses
+    debug_samples = []
+    
     for idx, row in tqdm(df.iterrows(), total=len(df), desc=model_name):
         text = row['tweet']
         true_label = row['sarcastic']
         
-        pred = get_prediction(model, tokenizer, text)
+        pred, raw_response = get_prediction(model, tokenizer, text)
         predictions.append(pred)
+        
+        # Collect first 5 samples for debugging
+        if len(debug_samples) < 5:
+            debug_samples.append({
+                'text': text[:80],
+                'true': true_label,
+                'pred': pred,
+                'response': raw_response[:100]
+            })
         
         if pred == -1:
             unclear += 1
@@ -177,6 +191,13 @@ def evaluate_model(model, tokenizer, df, model_name, sample_size=None):
     print(f"  Recall:    {recall:.2%}")
     print(f"  F1 Score:  {f1:.2%}")
     print(f"  Unclear:   {unclear}")
+    
+    # Print debug samples
+    print(f"\nDebug Samples:")
+    for i, sample in enumerate(debug_samples, 1):
+        print(f"\n  {i}. Text: {sample['text']}...")
+        print(f"     True: {sample['true']} | Pred: {sample['pred']}")
+        print(f"     Response: '{sample['response']}'")
     
     return results, predictions
 

@@ -7,3 +7,5 @@ accelerate
 peft
 bitsandbytes
 scikit-learn
+google
+openai
