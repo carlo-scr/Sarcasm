@@ -11,3 +11,6 @@ results_*_model.json
 comparative_results.json
 
 wandb/
+
+# Environment variables (API keys)
+.env
