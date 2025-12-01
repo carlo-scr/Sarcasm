@@ -207,8 +207,15 @@ def main():
     print("COMPARATIVE MODEL EVALUATION")
     print("="*70)
     
-    test_csv_path = 'data/splits/gen_test.csv'
-    print(f"\nLoading GEN-sarc-notsarc test dataset from: {test_csv_path}")
+    dataset = 'SARC' # Options: 'IAC' or 'SARC'
+    if dataset == 'IAC':
+        test_csv_path = 'data/splits/gen_test.csv' # evaluate on IAC
+        print(f"\nLoading GEN-sarc-notsarc test dataset from: {test_csv_path}")
+    elif dataset == 'SARC':
+        test_csv_path = 'data/SARC/train-balanced-sarcasm.csv' # evaluate on SARC (OOD for generalization)
+        print(f"\nLoading SARC test dataset from: {test_csv_path}")
+    else:
+        print(f"❌ Unknown dataset: {dataset}")
     
     if not os.path.exists(test_csv_path):
         print(f"❌ Test split not found at {test_csv_path}")
@@ -218,11 +225,21 @@ def main():
     df_test = pd.read_csv(test_csv_path)
     print(f"✓ Loaded: {len(df_test)} samples")
     
-    # Sample 1000 examples for faster evaluation (500 from each class for balance)
-    sarc_samples = df_test[df_test['class'] == 'sarc'].sample(n=min(500, (df_test['class'] == 'sarc').sum()), random_state=42)
-    notsarc_samples = df_test[df_test['class'] == 'notsarc'].sample(n=min(500, (df_test['class'] == 'notsarc').sum()), random_state=42)
-    df_test = pd.concat([sarc_samples, notsarc_samples]).sample(frac=1, random_state=42).reset_index(drop=True)
-    
+    if dataset == 'IAC':
+        # Sample 1000 examples for faster evaluation (500 from each class for balance)
+        sarc_samples = df_test[df_test['class'] == 'sarc'].sample(n=min(500, (df_test['class'] == 'sarc').sum()), random_state=42)
+        notsarc_samples = df_test[df_test['class'] == 'notsarc'].sample(n=min(500, (df_test['class'] == 'notsarc').sum()), random_state=42)
+        df_test = pd.concat([sarc_samples, notsarc_samples]).sample(frac=1, random_state=42).reset_index(drop=True)
+    elif dataset == 'SARC':
+        sarc_samples = df_test[df_test['label'] == 1].sample(n=min(500, (df_test['label'] == 1).sum()), random_state=42)
+        notsarc_samples = df_test[df_test['label'] == 0].sample(n=min(500, (df_test['label'] == 0).sum()), random_state=42)
+        sarc_df = sarc_samples[['label', 'comment']].reset_index().rename(columns={"index": "id", "label": "class", "comment": "text"})
+        notsarc_df = notsarc_samples[['label', 'comment']].reset_index().rename(columns={"index": "id", "label": "class", "comment": "text"})
+        df_test = pd.concat([sarc_df, notsarc_df]).sample(frac=1, random_state=42).reset_index(drop=True)
+        df_test["class"] = df_test["class"].map({0: "nonsarc", 1: "sarc"})
+    else:
+        print(f"❌ Unknown dataset: {dataset}")
+
     print(f"✓ Sampled {len(df_test)} examples for evaluation (balanced)")
     
     # Count classes
@@ -252,7 +269,7 @@ def main():
     
     # Stage 2: After SFT
     print(f"\n{'='*70}")
-    print("STAGE 2: After SFT (Phase 1 - GEN training)")
+    print(f"STAGE 2: After SFT (Phase 1 - training using {dataset} dataset)")
     print("="*70)
     sft_path = "models/sft"
     if os.path.exists(sft_path):
@@ -271,7 +288,7 @@ def main():
     
     # Stage 3: After DPO
     print(f"\n{'='*70}")
-    print("STAGE 3: After DPO (Phase 2 - GEN preference refinement)")
+    print(f"STAGE 3: After DPO (Phase 2 - preference refinement using {dataset} dataset for SFT step and iSarc for DPO step)")
     print("="*70)
     dpo_path = "models/dpo_enhanced"
     if os.path.exists(dpo_path):
