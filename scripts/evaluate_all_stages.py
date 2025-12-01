@@ -4,7 +4,7 @@ Comprehensive evaluation script to compare all training stages:
 2. After SFT (Phase 1)
 3. After DPO (Phase 2)
 
-This script evaluates each model on the iSarcasm test set and saves comparative results.
+This script evaluates each model on the GEN-sarc-notsarc dataset and saves comparative results.
 """
 
 import pandas as pd
@@ -128,8 +128,8 @@ def evaluate_model(model, tokenizer, df, model_name, sample_size=None):
     debug_samples = []
     
     for idx, row in tqdm(df.iterrows(), total=len(df), desc=model_name):
-        text = row['tweet']
-        true_label = row['sarcastic']
+        text = row['text']  # GEN dataset uses 'text' column
+        true_label = 1 if row['class'] == 'sarc' else 0  # GEN dataset uses 'class' column
         
         pred, raw_response = get_prediction(model, tokenizer, text)
         predictions.append(pred)
@@ -207,18 +207,30 @@ def main():
     print("COMPARATIVE MODEL EVALUATION")
     print("="*70)
     
-    test_csv_path = 'data/splits/isarcasm_test.csv'
-    print(f"\nLoading held-out test set from: {test_csv_path}")
+    test_csv_path = 'data/splits/gen_test.csv'
+    print(f"\nLoading GEN-sarc-notsarc test dataset from: {test_csv_path}")
     
     if not os.path.exists(test_csv_path):
         print(f"❌ Test split not found at {test_csv_path}")
-        print("   Run 'python create_splits.py' first to create train/test splits.")
+        print("Run 'python scripts/split_gen_dataset.py' first to create train/test splits")
         return
     
-    df_test = pd.read_csv(test_csv_path, index_col=0)
-    print(f"✓ Test set: {len(df_test)} samples")
-    print(f"  Sarcastic: {df_test['sarcastic'].sum()} ({df_test['sarcastic'].mean():.1%})")
-    print(f"  Non-sarcastic: {len(df_test) - df_test['sarcastic'].sum()} ({1-df_test['sarcastic'].mean():.1%})")
+    df_test = pd.read_csv(test_csv_path)
+    print(f"✓ Loaded: {len(df_test)} samples")
+    
+    # Sample 1000 examples for faster evaluation (500 from each class for balance)
+    sarc_samples = df_test[df_test['class'] == 'sarc'].sample(n=min(500, (df_test['class'] == 'sarc').sum()), random_state=42)
+    notsarc_samples = df_test[df_test['class'] == 'notsarc'].sample(n=min(500, (df_test['class'] == 'notsarc').sum()), random_state=42)
+    df_test = pd.concat([sarc_samples, notsarc_samples]).sample(frac=1, random_state=42).reset_index(drop=True)
+    
+    print(f"✓ Sampled {len(df_test)} examples for evaluation (balanced)")
+    
+    # Count classes
+    sarc_count = (df_test['class'] == 'sarc').sum()
+    notsarc_count = (df_test['class'] == 'notsarc').sum()
+    
+    print(f"  Sarcastic: {sarc_count} ({sarc_count/len(df_test):.1%})")
+    print(f"  Non-sarcastic: {notsarc_count} ({notsarc_count/len(df_test):.1%})")
     
     all_results = []
     base_model_name = "Qwen/Qwen2.5-0.5B-Instruct"
@@ -240,13 +252,13 @@ def main():
     
     # Stage 2: After SFT
     print(f"\n{'='*70}")
-    print("STAGE 2: After SFT (Phase 1 - SARC training)")
+    print("STAGE 2: After SFT (Phase 1 - GEN training)")
     print("="*70)
     sft_path = "models/sft"
     if os.path.exists(sft_path):
         try:
             model, tokenizer = load_model_and_tokenizer(sft_path, is_adapter=True, base_model_name=base_model_name)
-            results_sft, _ = evaluate_model(model, tokenizer, df_test, "SFT Model (SARC)")
+            results_sft, _ = evaluate_model(model, tokenizer, df_test, "SFT Model (GEN)")
             all_results.append(results_sft)
             
             del model
@@ -259,13 +271,13 @@ def main():
     
     # Stage 3: After DPO
     print(f"\n{'='*70}")
-    print("STAGE 3: After DPO (Phase 2 - iSarcasm refinement)")
+    print("STAGE 3: After DPO (Phase 2 - GEN preference refinement)")
     print("="*70)
     dpo_path = "models/dpo_enhanced"
     if os.path.exists(dpo_path):
         try:
             model, tokenizer = load_model_and_tokenizer(dpo_path, is_adapter=True, base_model_name=base_model_name)
-            results_dpo, _ = evaluate_model(model, tokenizer, df_test, "DPO Model (iSarcasm Enhanced)")
+            results_dpo, _ = evaluate_model(model, tokenizer, df_test, "DPO Model (GEN Enhanced)")
             all_results.append(results_dpo)
             
             del model
@@ -305,6 +317,7 @@ def main():
         # Save all results
         comparison = {
             'evaluation_date': datetime.now().isoformat(),
+            'test_set': 'gen_test.csv (held-out split from GEN-sarc-notsarc)',
             'test_set_size': len(df_test),
             'models': all_results
         }

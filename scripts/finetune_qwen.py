@@ -1,7 +1,7 @@
 """
-Fine-tune Qwen2.5-0.5B on SARC dataset using LoRA (Phase 1: SFT).
-This script trains on the large SARC dataset to learn general sarcasm patterns.
-Phase 2 (DPO) will use iSarcasm for preference alignment.
+Fine-tune Qwen2.5-0.5B on GEN-sarc-notsarc dataset using LoRA (Phase 1: SFT).
+This script trains on the GEN training split to learn general sarcasm patterns.
+Phase 2 (DPO) will use the same training split for preference alignment.
 """
 
 import pandas as pd
@@ -16,14 +16,22 @@ from transformers import (
 from datasets import Dataset
 from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
 import json
+import os
 
 def load_and_prepare_data(csv_path, tokenizer, max_length=256, sample_size=None):
     """Load and prepare the dataset for training."""
     print(f"Loading dataset from: {csv_path}")
     df = pd.read_csv(csv_path)
     
-    # Check if it's SARC or iSarcasm format
-    if 'comment' in df.columns:
+    # Check dataset format
+    if 'class' in df.columns and 'text' in df.columns:
+        # GEN dataset format
+        print("Detected GEN-sarc-notsarc dataset format")
+        # Convert to standard format
+        df['label'] = (df['class'] == 'sarc').astype(int)
+        text_col = 'text'
+        label_col = 'label'
+    elif 'comment' in df.columns:
         # SARC dataset format
         text_col = 'comment'
         label_col = 'label'
@@ -39,8 +47,16 @@ def load_and_prepare_data(csv_path, tokenizer, max_length=256, sample_size=None)
     
     # Sample if specified
     if sample_size and len(df) > sample_size:
-        df = df.sample(n=sample_size, random_state=42)
-        print(f"Sampled {sample_size} examples from dataset")
+        # Sample while maintaining class balance
+        sarc_df = df[df[label_col] == 1]
+        notsarc_df = df[df[label_col] == 0]
+        
+        n_per_class = sample_size // 2
+        sarc_sample = sarc_df.sample(n=min(n_per_class, len(sarc_df)), random_state=42)
+        notsarc_sample = notsarc_df.sample(n=min(n_per_class, len(notsarc_df)), random_state=42)
+        
+        df = pd.concat([sarc_sample, notsarc_sample]).sample(frac=1, random_state=42)
+        print(f"Sampled {len(df)} examples from dataset (balanced)")
     
     print(f"Total samples: {len(df)}")
     print(f"Sarcastic: {df[label_col].sum()}, Non-sarcastic: {len(df) - df[label_col].sum()}")
@@ -175,27 +191,35 @@ def main():
     # Setup
     model_name = "Qwen/Qwen2.5-0.5B-Instruct"
     
-    # PHASE 1: Train on SARC dataset (large volume for pattern learning)
-    sarc_path = "data/SARC/train-balanced-sarcasm.csv"
+    # PHASE 1: Train on GEN dataset training split
+    gen_train_path = "data/splits/gen_train.csv"
     output_dir = "models/sft"
     
     print("="*70)
-    print("PHASE 1: Supervised Fine-Tuning on SARC Dataset")
+    print("PHASE 1: Supervised Fine-Tuning on GEN Dataset (Training Split)")
     print("="*70)
-    print("Strategy: Train on large SARC dataset for general sarcasm patterns")
-    print("Next Phase: DPO on iSarcasm for preference alignment")
+    print("Strategy: Train on GEN training split for sarcasm detection")
+    print("Test set (data/splits/gen_test.csv) is held-out for evaluation only")
+    print("Next Phase: DPO on same training data for preference alignment")
     print("="*70)
+    
+    # Check if split exists
+    if not os.path.exists(gen_train_path):
+        print(f"\n❌ Training split not found at {gen_train_path}")
+        print("Run 'python scripts/split_gen_dataset.py' first to create train/test splits")
+        return
     
     # Load model and tokenizer
     model, tokenizer = setup_lora_model(model_name)
     
-    # Prepare data (you can adjust sample_size to control training time)
-    # Set sample_size=None to use full dataset, or e.g., 100000 for subset
+    # Prepare data
+    # For full training, set sample_size=None
+    # For faster training, use sample_size (e.g., 2000, 4000)
     train_dataset, val_dataset = load_and_prepare_data(
-        sarc_path, 
+        gen_train_path, 
         tokenizer,
-        sample_size=5000  # Using 5k samples for memory-constrained systems (~15-30 min)
-        # Increase to 10k (30-60 min) or 20k (1-2 hrs) if you have more memory
+        sample_size=4000  # Using 4k samples for reasonable training time
+        # Set to None to use full training set (~5k samples)
     )
     
     # Train
@@ -203,6 +227,7 @@ def main():
     
     print("\nTraining complete!")
     print(f"Model saved to: {output_dir}")
+    print(f"Test set remains untouched at: data/splits/gen_test.csv")
 
 if __name__ == "__main__":
     main()

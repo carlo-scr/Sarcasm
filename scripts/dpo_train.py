@@ -1,6 +1,6 @@
 """
 Direct Preference Optimization (DPO) for sarcasm detection - Phase 2.
-This script uses iSarcasm dataset for preference alignment after SFT on SARC.
+This script uses GEN dataset training split for preference alignment after SFT.
 
 ENHANCED VERSION - Quick Fixes Applied:
 1. Richer preference pairs with explicit reasoning
@@ -42,22 +42,26 @@ class ConfidenceWeightedDPOTrainer(DPOTrainer):
         return loss, metrics 
 def prepare_dpo_dataset(train_csv_path):
     """
-    Prepare iSarcasm TRAINING dataset with enhanced preference pairs.
+    Prepare GEN TRAINING dataset with enhanced preference pairs.
     
     Args:
-        train_csv_path: Path to training split CSV (data/splits/isarcasm_train.csv)
+        train_csv_path: Path to training split CSV (data/splits/gen_train.csv)
     
     Returns:
         Dataset with prompt/chosen/rejected pairs
     """
-    print(f"Loading iSarcasm training data from: {train_csv_path}")
-    df = pd.read_csv(train_csv_path, index_col=0)
+    print(f"Loading GEN training data from: {train_csv_path}")
+    df = pd.read_csv(train_csv_path)
+    
+    # Convert GEN format to standard format
+    df['sarcastic'] = (df['class'] == 'sarc').astype(int)
+    df['tweet'] = df['text']  # Rename for compatibility
     
     print(f"Original training samples: {len(df)}")
     print(f"  Sarcastic: {df['sarcastic'].sum()} ({df['sarcastic'].mean():.1%})")
     print(f"  Non-sarcastic: {len(df) - df['sarcastic'].sum()} ({1-df['sarcastic'].mean():.1%})")
     
-    # BALANCE DATASET: Oversample sarcastic examples to 50/50 ratio
+    # BALANCE DATASET: Sample to ensure 50/50 ratio
     sarcastic_df = df[df['sarcastic'] == 1]
     non_sarcastic_df = df[df['sarcastic'] == 0]
     
@@ -334,20 +338,32 @@ def train_dpo(csv_path, output_dir="./qwen_sarcasm_dpo", adapter_path=None):
     return dpo_trainer
 
 def main():
-    # PHASE 2: DPO on iSarcasm dataset
-    train_csv_path = "data/splits/isarcasm_train.csv"  # Pre-split training data
+    # PHASE 2: DPO on GEN dataset training split
+    train_csv_path = "data/splits/gen_train.csv"  # Same training split as SFT
     sft_adapter_path = "models/sft"  # From Phase 1 SFT
     output_dir = "models/dpo_enhanced"  # Enhanced version
     
     print("="*70)
     print("PHASE 2: Direct Preference Optimization (DPO)")
     print("="*70)
-    print("Strategy: Refine SARC-trained model with iSarcasm preferences")
+    print("Strategy: Refine SFT model with preference-based learning")
     print(f"Training data: {train_csv_path}")
     print(f"Base model: {sft_adapter_path}")
+    print(f"Test set (data/splits/gen_test.csv) remains untouched for evaluation")
     print("="*70)
     
-    # Train DPO starting from SARC SFT model
+    # Check if files exist
+    if not os.path.exists(train_csv_path):
+        print(f"\n❌ Training split not found at {train_csv_path}")
+        print("Run 'python scripts/split_gen_dataset.py' first to create train/test splits")
+        return
+    
+    if not os.path.exists(sft_adapter_path):
+        print(f"\n❌ SFT model not found at {sft_adapter_path}")
+        print("Run 'python scripts/finetune_qwen.py' first to train SFT model")
+        return
+    
+    # Train DPO starting from SFT model
     train_dpo(
         train_csv_path, 
         output_dir=output_dir, 
@@ -360,8 +376,9 @@ def main():
     print(f"Phase 1 (SFT): {sft_adapter_path}")
     print(f"Phase 2 (DPO): {output_dir}")
     print("\nWorkflow Summary:")
-    print("  1. SFT on SARC → Learn general sarcasm patterns")
-    print("  2. DPO on iSarcasm → Refine with expert preferences")
+    print("  1. SFT on GEN training split → Learn sarcasm patterns")
+    print("  2. DPO on GEN training split → Refine with preferences")
+    print("  3. Evaluate on GEN test split → Measure performance")
     print("="*70)
 
 if __name__ == "__main__":
