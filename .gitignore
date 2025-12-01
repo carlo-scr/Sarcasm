@@ -8,3 +8,5 @@ qwen_sarcasm_dpo_enhanced/
 evaluation_results.json
 results_*_model.json
 comparative_results.json
+
+wandb/

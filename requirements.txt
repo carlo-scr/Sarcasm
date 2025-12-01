@@ -9,3 +9,7 @@ bitsandbytes
 scikit-learn
 google
 openai
+wandb
+matplotlib
+seaborn
+trl
