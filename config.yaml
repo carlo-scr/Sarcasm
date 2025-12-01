@@ -1,0 +1,125 @@
+# Complete Configuration for SFT + DPO Pipeline
+# MobileLLM-350M Sarcasm Detection
+
+# Model Configuration
+model:
+  base_model: "facebook/MobileLLM-350M"
+  model_type: "causal_lm"
+  max_length: 512
+  
+# Quantization (QLoRA)
+quantization:
+  load_in_4bit: true
+  bnb_4bit_compute_dtype: "float16"
+  bnb_4bit_quant_type: "nf4"
+  bnb_4bit_use_double_quant: true
+
+# LoRA Configuration
+lora:
+  r: 16                    # Rank - test: [8, 16, 32, 64]
+  lora_alpha: 16           # Scaling factor
+  lora_dropout: 0.1        # Dropout probability
+  target_modules:          # Which layers to apply LoRA
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+  bias: "none"
+  task_type: "CAUSAL_LM"
+
+# SFT Training Configuration
+sft:
+  learning_rate: 1e-4      # Test: [5e-5, 1e-4, 2e-4]
+  num_train_epochs: 5      # Test: [3, 5, 10]
+  per_device_train_batch_size: 8   # Test: [8, 16, 32]
+  per_device_eval_batch_size: 8
+  gradient_accumulation_steps: 4
+  warmup_ratio: 0.1
+  weight_decay: 0.01
+  logging_steps: 10
+  eval_steps: 50
+  save_steps: 50
+  save_total_limit: 3
+  fp16: true
+  optim: "paged_adamw_8bit"
+  max_grad_norm: 1.0
+  
+  # Early stopping based on F1
+  early_stopping:
+    enabled: true
+    patience: 3
+    metric: "eval_f1"
+    mode: "max"
+
+# DPO Training Configuration  
+dpo:
+  beta: 0.1                # KL coefficient - test: [0.01, 0.02, 0.05, 0.1, 0.5, 1.0]
+  learning_rate: 5e-5      # Usually lower than SFT - test: [1e-5, 5e-5, 1e-4]
+  num_train_epochs: 3      # Usually fewer than SFT - test: [1, 2, 3, 5]
+  per_device_train_batch_size: 4
+  per_device_eval_batch_size: 4
+  gradient_accumulation_steps: 8
+  warmup_ratio: 0.1
+  weight_decay: 0.01
+  logging_steps: 5
+  eval_steps: 25
+  save_steps: 25
+  save_total_limit: 5
+  fp16: true
+  optim: "paged_adamw_8bit"
+  max_grad_norm: 0.5       # Lower for DPO stability
+  
+  # Loss configuration
+  loss_type: "sigmoid"     # Options: "sigmoid", "hinge", "ipo"
+  label_smoothing: 0.0
+  
+  # Early stopping based on F1
+  early_stopping:
+    enabled: true
+    patience: 2
+    metric: "eval_f1"
+    mode: "max"
+  
+  # Diagnostic thresholds
+  diagnostics:
+    kl_warning_threshold: 1.0      # Warn if KL > 1.0
+    min_reward_margin: 0.1         # Minimum difference between chosen/rejected
+    max_kl_divergence: 5.0         # Stop if KL exceeds this
+
+# Data Configuration
+data:
+  dataset_path: "data/GEN-sarc-notsarc.csv"
+  train_split_path: "data/splits/gen_train.csv"
+  test_split_path: "data/splits/gen_test.csv"
+  val_split_ratio: 0.1
+  max_samples: null         # null = use all data
+  seed: 42
+  
+  # Preference pair quality
+  filter_low_confidence: false
+  min_preference_strength: 0.0
+
+# Output Configuration
+output:
+  base_dir: "./results"
+  sft_output_dir: "./results/sft"
+  dpo_output_dir: "./results/dpo"
+  logs_dir: "./results/logs"
+  plots_dir: "./results/plots"
+  checkpoints_dir: "./results/checkpoints"
+
+# Experiment Tracking
+tracking:
+  use_wandb: false
+  project_name: "mobilellm-sarcasm"
+  run_name: null           # Auto-generated if null
+
+# Grid Search (for hyperparameter tuning)
+grid_search:
+  enabled: false
+  sft:
+    learning_rate: [5e-5, 1e-4, 2e-4]
+    lora_r: [8, 16, 32]
+  dpo:
+    beta: [0.01, 0.05, 0.1, 0.5]
+    learning_rate: [1e-5, 5e-5]
