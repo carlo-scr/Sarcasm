@@ -339,7 +339,7 @@ def main():
             'models': all_results
         }
         
-        with open('comparative_results.json', 'w') as f:
+        with open(f'comparative_results_{dataset}.json', 'w') as f:
             json.dump(comparison, f, indent=2)
         
         print(f"\n✓ Results saved to comparative_results.json")
