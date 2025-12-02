@@ -1,0 +1,57 @@
+{
+  "evaluation_date": "2025-12-02T13:16:20.326985",
+  "test_set": "SARC train-balanced-sarcasm.csv",
+  "test_set_size": 500,
+  "eval_seed": 10,
+  "sample_size": 500,
+  "models": [
+    {
+      "model_name": "Base Model (Zero-shot)",
+      "total_samples": 500,
+      "valid_predictions": 500,
+      "unclear_responses": 0,
+      "correct_predictions": 255,
+      "accuracy": 0.51,
+      "precision": 0.5108225108225108,
+      "recall": 0.472,
+      "f1_score": 0.4906444906444906,
+      "true_positives": 118,
+      "false_positives": 113,
+      "true_negatives": 137,
+      "false_negatives": 132,
+      "timestamp": "2025-12-02T13:08:31.060783"
+    },
+    {
+      "model_name": "SFT Model (GEN)",
+      "total_samples": 500,
+      "valid_predictions": 500,
+      "unclear_responses": 0,
+      "correct_predictions": 263,
+      "accuracy": 0.526,
+      "precision": 0.5160493827160494,
+      "recall": 0.836,
+      "f1_score": 0.6381679389312978,
+      "true_positives": 209,
+      "false_positives": 196,
+      "true_negatives": 54,
+      "false_negatives": 41,
+      "timestamp": "2025-12-02T13:12:24.593832"
+    },
+    {
+      "model_name": "DPO Model (Mistakes)",
+      "total_samples": 500,
+      "valid_predictions": 500,
+      "unclear_responses": 0,
+      "correct_predictions": 282,
+      "accuracy": 0.564,
+      "precision": 0.5379146919431279,
+      "recall": 0.908,
+      "f1_score": 0.6755952380952381,
+      "true_positives": 227,
+      "false_positives": 195,
+      "true_negatives": 55,
+      "false_negatives": 23,
+      "timestamp": "2025-12-02T13:16:20.321757"
+    }
+  ]
+}

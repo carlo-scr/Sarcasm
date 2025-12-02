@@ -18,7 +18,7 @@ import os
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, classification_report
 
 # Fixed seed for reproducibility
-EVAL_SEED = 42
+EVAL_SEED = 10
 EVAL_SAMPLE_SIZE = 500  # 250 per class
 
 
