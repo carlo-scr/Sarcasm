@@ -85,7 +85,7 @@ def mine_preferences(
     
     base_model = AutoModelForCausalLM.from_pretrained(
         base_model_name,
-        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+        dtype=torch.float16 if device == "cuda" else torch.float32,
         device_map="auto",
         trust_remote_code=True
     )
