@@ -22,6 +22,7 @@ SFT_ADAPTER = str(PROJECT_ROOT / "models" / "sft")
 DPO_ADAPTER = str(PROJECT_ROOT / "models" / "qwen_dpo_mistakes")
 TEST_DATA = str(PROJECT_ROOT / "data" / "splits" / "gen_test.csv")
 OUTPUT_FILE = str(PROJECT_ROOT / "results" / "sft_vs_dpo_comparison.json")
+OUTPUT_CSV = str(PROJECT_ROOT / "results" / "sft_vs_dpo_first_50.csv")
 DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
 
 print(f"Using device: {DEVICE}")
@@ -150,6 +151,7 @@ print("="*70)
 
 found_example = False
 example_case = None
+first_50_results = []
 
 for idx, row in tqdm(test_df.iterrows(), total=len(test_df), desc="Searching"):
     text = row['text']
@@ -158,6 +160,19 @@ for idx, row in tqdm(test_df.iterrows(), total=len(test_df), desc="Searching"):
     # Get predictions with confidence
     sft_pred, sft_response, sft_confidence = get_prediction(sft_model, tokenizer, text)
     dpo_pred, dpo_response, dpo_confidence = get_prediction(dpo_model, tokenizer, text)
+    
+    # Store first 30 results
+    if idx < 50:
+        first_50_results.append({
+            'text': text,
+            'true_label': row['class'],
+            'sft_prediction': 'Yes' if sft_pred == 1 else 'No' if sft_pred == 0 else 'Unclear',
+            'sft_confidence': round(sft_confidence, 2),
+            'sft_response': sft_response,
+            'dpo_prediction': 'Yes' if dpo_pred == 1 else 'No' if dpo_pred == 0 else 'Unclear',
+            'dpo_confidence': round(dpo_confidence, 2),
+            'dpo_response': dpo_response
+        })
     
     # Check if this is the case we're looking for
     sft_correct = (sft_pred == true_label)
@@ -189,6 +204,8 @@ for idx, row in tqdm(test_df.iterrows(), total=len(test_df), desc="Searching"):
         }
         found_example = True
         print(f"\n✅ FOUND EXAMPLE at sample {idx+1}!")
+        # break
+    if idx > 50:
         break
 
 print("\n" + "="*70)
@@ -247,6 +264,13 @@ else:
         json.dump(output_data, f, indent=2)
     
     print(f"\n✓ Results saved to: {output_path}")
+
+# Save first 30 results to CSV
+csv_output_path = Path(OUTPUT_CSV)
+csv_output_path.parent.mkdir(parents=True, exist_ok=True)
+first_50_df = pd.DataFrame(first_50_results)
+first_50_df.to_csv(csv_output_path, index=False)
+print(f"✓ First 30 results saved to: {csv_output_path}")
 
 print("\n" + "="*70)
 print("✅ ANALYSIS COMPLETE")
