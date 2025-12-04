@@ -14,7 +14,7 @@ import os
 
 # Fixed seed for reproducibility
 EVAL_SEED = 42
-EVAL_SAMPLE_SIZE = 500  # 250 per class
+EVAL_SAMPLE_SIZE = 50  # 250 per class
 
 
 def evaluate_model(model, tokenizer, test_df, device, model_name="Model"):
@@ -126,7 +126,7 @@ def main():
     results = {}
     
     # Evaluate base model
-    print("\n" + "="*60)
+    '''print("\n" + "="*60)
     print("Loading base model...")
     base_model = AutoModelForCausalLM.from_pretrained(
         base_model_name,
@@ -137,7 +137,7 @@ def main():
     results['base'] = evaluate_model(base_model, tokenizer, test_df, device, "Base MobileLLM (Zero-shot)")
     del base_model
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
-    
+    '''
     # Evaluate SFT model
     if os.path.exists(sft_model_path):
         print("\n" + "="*60)

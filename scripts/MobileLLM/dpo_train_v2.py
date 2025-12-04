@@ -192,7 +192,7 @@ class EnhancedDPOTrainer(DPOTrainer):
             )
 
 
-def load_isarcasm_for_dpo(csv_path="data/isarcasm2022.csv", sample_size=4000):
+def load_isarcasm_for_dpo(csv_path="data/isarcasm2022.csv", sample_size=500):
     """
     Load iSarcasm dataset for DPO training (NEW DATA, not used in SFT).
     
@@ -290,23 +290,20 @@ def prepare_dpo_dataset(df, split_ratio=0.9):
         text = row['tweet']
         is_sarcastic = row['sarcastic']
         
-        # Base prompt
-        prompt = f"""Is the following text sarcastic? Sarcasm involves saying the opposite of what is meant, often using irony, exaggeration, or mockery.
+        # Base prompt - simple binary classification
+        prompt = f"""Is the following text sarcastic? Answer with only 'Yes' or 'No'.
 
 Text: "{text}"
 
 Answer:"""
         
+        # Simple Yes/No responses for clean classification signal
         if is_sarcastic:
-            # Chosen: Rich sarcastic response
-            chosen = np.random.choice(sarcasm_reasons)
-            # Rejected: Simple non-sarcastic
-            rejected = "Not sarcastic."
+            chosen = "Yes"
+            rejected = "No"
         else:
-            # Chosen: Rich non-sarcastic response
-            chosen = np.random.choice(non_sarcasm_reasons)
-            # Rejected: Simple sarcastic
-            rejected = "This is sarcastic."
+            chosen = "No"
+            rejected = "Yes"
         
         dpo_data.append({
             'prompt': prompt,
@@ -352,25 +349,36 @@ def evaluate_dpo_model(model, tokenizer, val_df, device):
             text = row['tweet']
             label = row['sarcastic']
             
-            prompt = f"""Is the following text sarcastic? Answer with 'Yes' or 'No'.
+            prompt = f"""Is the following text sarcastic? Answer with only 'Yes' or 'No'.
 
 Text: "{text}"
 
 Answer:"""
             
             inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512).to(device)
-            outputs = model.generate(**inputs, max_new_tokens=50, temperature=0.7, do_sample=False)
+            outputs = model.generate(**inputs, max_new_tokens=10, temperature=0.0, do_sample=False)
             response = tokenizer.decode(outputs[0], skip_special_tokens=True)
             
-            # Extract prediction
-            response_lower = response.lower()
-            if 'sarcastic' in response_lower and 'not sarcastic' not in response_lower:
+            # Extract prediction from response
+            # Get only the generated part (after the prompt)
+            generated = response[len(prompt):].strip().lower()
+            
+            # Look for yes/no in the first word
+            first_word = generated.split()[0] if generated.split() else ""
+            
+            if first_word.startswith('yes') or first_word == 'y':
                 pred = 1
-            elif 'not sarcastic' in response_lower or 'no' in response_lower.split()[:5]:
+            elif first_word.startswith('no') or first_word == 'n':
                 pred = 0
             else:
-                # Default to majority class
-                pred = 0
+                # Fallback: check first 10 characters
+                if 'yes' in generated[:10]:
+                    pred = 1
+                elif 'no' in generated[:10]:
+                    pred = 0
+                else:
+                    # Default to 0 if completely unclear
+                    pred = 0
             
             predictions.append(pred)
             labels.append(label)
@@ -403,9 +411,9 @@ def train_dpo_with_config(
     sft_model_path="models/mobilellm_sft",
     dpo_output_dir="models/mobilellm_dpo",
     beta=0.1,
-    num_epochs=3,
+    num_epochs=4,
     learning_rate=5e-5,
-    sample_size=4000,
+    sample_size=500,
     use_wandb=True,
     wandb_project="sarcasm-dpo",
     preference_data_path=None
@@ -591,10 +599,15 @@ def train_dpo_with_config(
         if os.path.exists(summary_path):
             with open(summary_path, 'r') as f:
                 summary = json.load(f)
-            print(f"\nSFT Model Performance on this data:")
-            print(f"  Accuracy: {summary['sft_accuracy']:.1%}")
-            print(f"  Correct: {summary['correct_predictions']}")
-            print(f"  Incorrect: {summary['incorrect_predictions']}")
+            print(f"\nDataset Statistics:")
+            if 'sft_accuracy' in summary:
+                print(f"  Accuracy: {summary['sft_accuracy']:.1%}")
+            if 'sft_mistakes' in summary:
+                print(f"  SFT Mistakes (hard): {summary['sft_mistakes']} ({summary.get('ratio_mistakes', 0):.1%})")
+                print(f"  SFT Correct (easy): {summary['sft_correct']} ({summary.get('ratio_correct', 0):.1%})")
+            if 'correct_predictions' in summary:
+                print(f"  Correct: {summary['correct_predictions']}")
+                print(f"  Incorrect: {summary['incorrect_predictions']}")
         
         # Split into train/val (90/10)
         split_idx = int(len(preference_data) * 0.9)
@@ -650,7 +663,7 @@ def train_dpo_with_config(
         logging_steps=20,
         eval_strategy="epoch",
         save_strategy="epoch",
-        save_total_limit=3,
+        save_total_limit=1,  # Only keep best checkpoint
         fp16=False,
         report_to="none",
         beta=beta,
@@ -727,10 +740,22 @@ def train_dpo_with_config(
     
     trainer.train()
     
-    # Save final model
-    print(f"\n✓ Saving DPO model to {dpo_output_dir}")
+    # Save final model (best model is already loaded due to load_best_model_at_end=True)
+    print(f"\n✓ Saving best DPO model to {dpo_output_dir}")
     trainer.save_model(dpo_output_dir)
     tokenizer.save_pretrained(dpo_output_dir)
+    
+    # Clean up intermediate checkpoints - only keep final best model
+    import shutil
+    checkpoint_dirs = [d for d in os.listdir(dpo_output_dir) if d.startswith('checkpoint-')]
+    if checkpoint_dirs:
+        print(f"\n✓ Cleaning up {len(checkpoint_dirs)} intermediate checkpoint(s)...")
+        for checkpoint_dir in checkpoint_dirs:
+            checkpoint_path = os.path.join(dpo_output_dir, checkpoint_dir)
+            if os.path.isdir(checkpoint_path):
+                shutil.rmtree(checkpoint_path)
+                print(f"  Removed: {checkpoint_dir}")
+        print("✓ Only best model retained")
     
     # Save training summary
     summary = {
@@ -775,11 +800,11 @@ def main():
     parser = argparse.ArgumentParser(description="DPO Training with Comprehensive Diagnostics")
     parser.add_argument("--sft_model", type=str, default="models/mobilellm_sft", help="Path to SFT model")
     parser.add_argument("--output_dir", type=str, default="models/mobilellm_dpo", help="Output directory")
-    parser.add_argument("--beta", type=float, default=0.1, help="DPO beta parameter")
+    parser.add_argument("--beta", type=float, default=0.1, help="DPO beta parameter (KL penalty strength)")
     parser.add_argument("--epochs", type=int, default=3, help="Number of epochs")
-    parser.add_argument("--lr", type=float, default=5e-5, help="Learning rate")
+    parser.add_argument("--lr", type=float, default=5e-6, help="Learning rate (default: 5e-6 for stability)")
     parser.add_argument("--sample_size", type=int, default=4000, help="Number of iSarcasm samples (if not using mined preferences)")
-    parser.add_argument("--preference_data", type=str, default=None, help="Path to mined preference pairs JSON")
+    parser.add_argument("--preference_data", type=str, default=None, help="Path to mined preference pairs JSON (use None for synthetic iSarcasm pairs)")
     parser.add_argument("--beta_sweep", action="store_true", help="Run beta hyperparameter sweep")
     parser.add_argument("--no_wandb", action="store_true", help="Disable WandB logging")
     parser.add_argument("--wandb_project", type=str, default="sarcasm-detection", help="WandB project name")

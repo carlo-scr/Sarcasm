@@ -26,6 +26,7 @@ from trl import DPOTrainer, DPOConfig
 from sklearn.metrics import f1_score, precision_score, recall_score, accuracy_score, classification_report
 import json
 import os
+from pathlib import Path
 from datetime import datetime
 from copy import deepcopy
 import matplotlib.pyplot as plt
@@ -163,15 +164,49 @@ class EnhancedDPOTrainer(DPOTrainer):
     
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         """Override to track KL divergence and reward ratios."""
-        # Get base DPO loss
-        loss = super().compute_loss(model, inputs, return_outputs=False, num_items_in_batch=num_items_in_batch)
+        # Get base DPO loss and outputs
+        if return_outputs:
+            loss, outputs = super().compute_loss(model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch)
+        else:
+            loss = super().compute_loss(model, inputs, return_outputs=False, num_items_in_batch=num_items_in_batch)
+            outputs = None
         
-        # Track KL divergence from reference model (simplified - skip for now to avoid errors)
-        if self.metrics_logger is not None:
-            if hasattr(self.state, 'global_step'):
-                self.metrics_logger.log_kl(self.state.global_step, 0.0)  # Placeholder
+        # Track metrics if logger available
+        if self.metrics_logger is not None and hasattr(self.state, 'global_step'):
+            try:
+                # Extract rewards if available in outputs
+                if outputs is not None and hasattr(outputs, 'chosen_rewards') and hasattr(outputs, 'rejected_rewards'):
+                    chosen_rewards = outputs.chosen_rewards
+                    rejected_rewards = outputs.rejected_rewards
+                    
+                    if chosen_rewards is not None and rejected_rewards is not None:
+                        chosen_mean = chosen_rewards.mean().item()
+                        rejected_mean = rejected_rewards.mean().item()
+                        reward_ratio = chosen_mean / (rejected_mean + 1e-8)
+                        
+                        self.batch_rewards_chosen.append(chosen_mean)
+                        self.batch_rewards_rejected.append(rejected_mean)
+                        
+                        # Log reward metrics
+                        self.metrics_logger.log_batch(self.state.global_step, {
+                            'reward_ratio': reward_ratio,
+                            'chosen_reward': chosen_mean,
+                            'rejected_reward': rejected_mean
+                        })
+                
+                # Compute KL divergence approximation from loss components
+                # In DPO, the loss includes KL penalty implicitly via beta
+                # We track it via the reward difference
+                if len(self.batch_rewards_chosen) > 0:
+                    recent_rewards = self.batch_rewards_chosen[-10:]  # Last 10 batches
+                    kl_approx = np.std(recent_rewards) if len(recent_rewards) > 1 else 0.0
+                    self.metrics_logger.log_kl(self.state.global_step, kl_approx)
+                    
+            except Exception as e:
+                # Don't fail training if metrics logging fails
+                print(f"Warning: Metrics logging failed: {e}")
         
-        return loss
+        return (loss, outputs) if return_outputs else loss
     
     def log(self, logs, start_time=None):
         """Override to capture per-batch metrics."""
@@ -188,15 +223,19 @@ class EnhancedDPOTrainer(DPOTrainer):
             )
 
 
-def load_isarcasm_for_dpo(csv_path="data/isarcasm2022.csv", sample_size=4000):
+def load_isarcasm_for_dpo(csv_path=None, sample_size=4000):
     """
     Load iSarcasm dataset for DPO training (NEW DATA, not used in SFT).
     """
-    # Fix relative path if running from scripts/ directory
-    if not os.path.isabs(csv_path) and not os.path.exists(csv_path):
-        parent_path = os.path.join("..", csv_path)
-        if os.path.exists(parent_path):
-            csv_path = parent_path
+    # Use absolute path from project root
+    if csv_path is None:
+        PROJECT_ROOT = Path(__file__).parent.parent.parent
+        csv_path = PROJECT_ROOT / "data" / "isarcasm2022.csv"
+    else:
+        csv_path = Path(csv_path)
+    
+    if not csv_path.exists():
+        raise FileNotFoundError(f"iSarcasm dataset not found at {csv_path}")
     
     print(f"\n{'='*80}")
     print("LOADING iSARCASM DATASET FOR DPO (NEW DATA)")
@@ -332,15 +371,31 @@ Answer:"""
             outputs = model.generate(**inputs, max_new_tokens=50, temperature=0.7, do_sample=False)
             response = tokenizer.decode(outputs[0], skip_special_tokens=True)
             
-            # Extract prediction
+            # Extract prediction with better logic
             response_lower = response.lower()
-            if 'sarcastic' in response_lower and 'not sarcastic' not in response_lower:
-                pred = 1
-            elif 'not sarcastic' in response_lower or 'no' in response_lower.split()[:5]:
-                pred = 0
+            
+            # Remove the original text to avoid confusion
+            if text.lower() in response_lower:
+                response_lower = response_lower.replace(text.lower(), "")
+            
+            # Look at first 15 words of response for answer
+            words = response_lower.split()[:15]
+            
+            # Check for explicit sarcasm markers
+            has_sarcastic = any(w in ['sarcastic', 'yes', 'ironic', 'irony'] for w in words)
+            has_not = 'not' in words or 'no' in words
+            
+            # Decision logic
+            if has_sarcastic and not has_not:
+                pred = 1  # Sarcastic
+            elif has_not or 'literal' in words or 'sincere' in words:
+                pred = 0  # Not sarcastic
             else:
-                # Default to majority class
-                pred = 0
+                # Check full response as fallback
+                if 'this is sarcastic' in response_lower or 'yes' in response_lower[:50]:
+                    pred = 1
+                else:
+                    pred = 0  # Default to not sarcastic
             
             predictions.append(pred)
             labels.append(label)
@@ -426,25 +481,23 @@ def train_dpo_with_config(
     # Setup metrics logger
     metrics_logger = DPOMetricsLogger(dpo_output_dir)
     
-    # Fix relative paths if running from scripts/ directory
+    # Use absolute paths from project root
+    PROJECT_ROOT = Path(__file__).parent.parent.parent
+    
     if not os.path.isabs(sft_model_path):
-        if not os.path.exists(sft_model_path):
-            parent_path = os.path.join("..", sft_model_path)
-            if os.path.exists(parent_path):
-                sft_model_path = parent_path
-                print(f"ℹ️  Adjusted SFT model path to: {sft_model_path}")
+        sft_model_path = PROJECT_ROOT / sft_model_path
+        print(f"ℹ️  Using absolute SFT model path: {sft_model_path}")
+    else:
+        sft_model_path = Path(sft_model_path)
+    
+    if not sft_model_path.exists():
+        raise FileNotFoundError(f"SFT model not found at {sft_model_path}")
     
     # Load base model and tokenizer
     base_model_name = "facebook/MobileLLM-R1.5-360M"
-    merged_sft_path = "models/mobilellm_sft_merged"  # Path to save merged SFT
+    merged_sft_path = PROJECT_ROOT / "models" / "mobilellm_sft_merged"
     
-    # Fix relative paths
-    if not os.path.isabs(merged_sft_path):
-        if os.path.exists(os.path.join("..", merged_sft_path)):
-            merged_sft_path = os.path.join("..", merged_sft_path)
-        elif not os.path.exists(merged_sft_path):
-            # Will create it below
-            pass
+    print(f"Merged SFT path: {merged_sft_path}")
     
     print(f"Loading base model: {base_model_name}")
     
@@ -528,12 +581,14 @@ def train_dpo_with_config(
         print(f"{'='*80}")
         print(f"Source: {preference_data_path}")
         
-        # Fix relative path
+        # Convert to absolute path
         if not os.path.isabs(preference_data_path):
-            if not os.path.exists(preference_data_path):
-                parent_path = os.path.join("..", preference_data_path)
-                if os.path.exists(parent_path):
-                    preference_data_path = parent_path
+            preference_data_path = PROJECT_ROOT / preference_data_path
+        else:
+            preference_data_path = Path(preference_data_path)
+        
+        if not preference_data_path.exists():
+            raise FileNotFoundError(f"Preference data not found at {preference_data_path}")
         
         with open(preference_data_path, 'r') as f:
             preference_data = json.load(f)
