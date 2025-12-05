@@ -261,17 +261,6 @@ model = PeftModel.from_pretrained(base_model, "models/qwen_dpo_mistakes")
 | SFT Training | 6-8 GB | ~30 min |
 | DPO Training | 6-8 GB | ~20 min |
 
-## 📚 Citation
-
-```bibtex
-@misc{schreiber2025sarcasm,
-  title={Efficient Sarcasm Detection with Small Language Models via SFT and DPO},
-  author={Schreiber, Carlo},
-  year={2025},
-  institution={Stanford University, CS229}
-}
-```
-
 ## 🙏 Acknowledgments
 
 - [Qwen Team](https://github.com/QwenLM/Qwen2.5) for the base model
